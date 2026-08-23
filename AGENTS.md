@@ -771,9 +771,703 @@ Then teach me the ideal interview answer.
 
 ---
 
+# Learning Documentation — `learn.md`
+
+Maintain a file named **`learn.md` at the root of the repository**, alongside this `AGENTS.md`.
+
+```text
+fileTransfer/
+├── AGENTS.md
+├── learn.md
+├── README.md
+├── ...
+```
+
+`AGENTS.md` describes **how you should mentor me**.
+
+`learn.md` records **what I have learned from building the project**.
+
+The purpose of `learn.md` is NOT to become a development diary or a transcript of our conversations.
+
+Its purpose is:
+
+> **Six months from now, I should be able to read `learn.md` and reconstruct the important concepts, design decisions, debugging lessons, architecture, protocol, tradeoffs, and limitations of this project.**
+
+It should become my **project revision guide and interview-preparation document**.
+
+---
+
+## When to Update `learn.md`
+
+Update `learn.md` after a **meaningful learning event**, not after every interaction.
+
+Update it when we:
+
+* learn an important engineering concept
+* discover an important misconception
+* make a significant design decision
+* solve a meaningful bug
+* perform an informative experiment
+* complete a major milestone
+* change the architecture
+* change the protocol
+* discover an important tradeoff
+* learn an important testing principle
+* discover a meaningful performance issue
+* learn an important security concept
+* establish an important limitation
+
+Do NOT update it for every small conversation.
+
+---
+
+# What to Log
+
+## 1. Important Concepts
+
+Record concepts that are important to understanding the project.
+
+Examples:
+
+```text
+TCP as a byte stream
+
+partial reads
+
+partial writes
+
+message framing
+
+length-prefix protocols
+
+serialization
+
+network byte order
+
+blocking I/O
+
+file streaming
+
+buffering
+
+chunking
+
+checksums
+
+SHA-256
+
+timeouts
+
+connection lifecycle
+
+threads
+
+race conditions
+
+authentication
+
+idempotency
+
+device discovery
+```
+
+For important concepts capture:
+
+```text
+What is it?
+
+Why does it matter?
+
+How does it work?
+
+How does our project use it?
+
+What common misconception should I avoid?
+```
+
+Do not document every trivial API or Python syntax feature.
+
+---
+
+# 2. Mental Models
+
+Record useful mental models that make the system easier to reason about.
+
+For example:
+
+```text
+TCP is not a message delivery system.
+
+TCP provides a reliable ordered byte stream.
+
+Therefore:
+
+send(message1)
+send(message2)
+
+does NOT guarantee:
+
+recv() → message1
+recv() → message2
+```
+
+Prioritize mental models over memorized definitions.
+
+---
+
+# 3. Important Design Decisions
+
+Whenever we make a meaningful engineering decision, document it.
+
+Use this structure:
+
+```markdown
+## Decision: <short title>
+
+### Problem
+What problem were we solving?
+
+### Decision
+What did we choose?
+
+### Why?
+Why did we choose it?
+
+### Alternatives
+What alternatives existed?
+
+### Tradeoffs
+What do we gain and sacrifice?
+
+### Consequences
+How does this affect the rest of the system?
+```
+
+Examples:
+
+* TCP vs UDP
+* framing strategy
+* serialization format
+* chunk size
+* streaming strategy
+* threading vs async
+* protocol structure
+* resume strategy
+* integrity strategy
+* authentication strategy
+* architecture/module boundaries
+
+Do not document trivial decisions.
+
+---
+
+# 4. Significant Bugs and Debugging Lessons
+
+Log bugs selectively.
+
+Do NOT record every:
+
+* typo
+* syntax error
+* indentation error
+* missing import
+* wrong filename
+* obvious beginner mistake
+* temporary debugging print
+
+Only record bugs that teach a **general engineering lesson**.
+
+Good examples:
+
+* misunderstanding TCP behavior
+* partial reads/writes
+* protocol desynchronization
+* serialization errors
+* byte-order mistakes
+* connection lifecycle mistakes
+* incorrect file offsets
+* resume corruption
+* race conditions
+* deadlocks
+* resource leaks
+* checksum mismatches
+* concurrency bugs
+* security mistakes
+* cross-platform problems
+* performance bottlenecks
+
+For meaningful bugs use:
+
+```markdown
+## Debugging Lesson: <short title>
+
+### Symptom
+What happened?
+
+### Root Cause
+What was actually wrong?
+
+### Why Did It Happen?
+What incorrect assumption caused it?
+
+### Fix
+How did we fix it?
+
+### General Lesson
+What principle should I remember so I don't make this mistake again?
+```
+
+The **General Lesson** is the most important part.
+
+---
+
+# 5. Corrected Mental Models
+
+If I initially misunderstand something and later understand it correctly, record the correction.
+
+Example:
+
+```markdown
+## Corrected Mental Model: TCP `recv()`
+
+### Initial assumption
+
+I assumed one `recv()` corresponds to one `send()`.
+
+### Correct model
+
+TCP provides an ordered byte stream rather than application-level message boundaries.
+
+### Why this matters
+
+Our application therefore needs its own framing protocol.
+```
+
+These corrections are especially valuable for revision.
+
+---
+
+# 6. Important Questions and Answers
+
+If I ask a question that reveals an important conceptual gap, record the resulting understanding.
+
+Focus on the **reasoning**, not merely the final answer.
+
+For example, instead of:
+
+```text
+sendall() sends all the data.
+```
+
+capture:
+
+```text
+A socket send operation may handle only part of the application's
+buffer. Application code therefore needs to account for partial
+writes. sendall() repeatedly sends until the complete buffer has
+been handled or an error occurs.
+```
+
+---
+
+# 7. Protocol Documentation
+
+Maintain a section describing the actual protocol implemented by the project.
+
+Document important protocol messages including:
+
+```text
+Purpose
+
+Message type
+
+Fields
+
+Field sizes
+
+Encoding
+
+Byte order
+
+Expected sender
+
+Expected receiver
+
+What happens next
+
+Possible failure conditions
+```
+
+Keep this synchronized with the actual implementation.
+
+---
+
+# 8. Architecture Evolution
+
+Record meaningful changes to the architecture.
+
+For example:
+
+```text
+Version 1
+Simple client/server transfer
+
+        ↓
+
+Version 2
+Added message framing
+
+        ↓
+
+Version 3
+Separated protocol and transfer logic
+
+        ↓
+
+Version 4
+Added transfer manager
+
+        ↓
+
+Version 5
+Added concurrency
+```
+
+For significant changes explain:
+
+```text
+What was wrong with the previous design?
+
+Why did we change it?
+
+What problem does the new design solve?
+
+What complexity did we introduce?
+```
+
+This allows me to explain **why the architecture evolved**, not merely what the final architecture looks like.
+
+---
+
+# 9. Experiments
+
+When we intentionally test something to understand system behavior, record useful experiments.
+
+Use:
+
+```markdown
+## Experiment: <title>
+
+### Question
+What were we trying to find out?
+
+### Prediction
+What did I think would happen?
+
+### Setup
+What did we test?
+
+### Result
+What happened?
+
+### Explanation
+Why did it happen?
+
+### Lesson
+What should I remember?
+```
+
+Especially record experiments involving networking, TCP, buffering, concurrency, performance, and failure behavior.
+
+---
+
+# 10. Testing Knowledge
+
+Record important lessons about testing.
+
+Examples:
+
+```text
+Why 0-byte files matter
+
+Why binary files matter
+
+Why Unicode filenames matter
+
+Why interrupted connections must be tested
+
+Why corrupted data must be tested
+
+Why resume must be tested
+
+Why concurrent transfers must be tested
+
+Unit vs integration tests
+
+Protocol tests
+
+Failure injection
+```
+
+Don't simply record that a test was added.
+
+Record **why the test exists and what failure it protects against**.
+
+---
+
+# 11. Performance Lessons
+
+Record meaningful performance findings.
+
+Examples:
+
+```text
+throughput bottlenecks
+
+memory behavior
+
+CPU bottlenecks
+
+chunk-size effects
+
+concurrency effects
+
+latency observations
+```
+
+Distinguish measured facts from assumptions.
+
+Do not record arbitrary benchmark numbers unless they teach something useful.
+
+---
+
+# 12. Security Lessons
+
+Record important security concepts and decisions.
+
+Examples:
+
+```text
+authentication vs authorization
+
+authentication vs encryption
+
+replay attacks
+
+MITM attacks
+
+TLS
+
+certificates
+
+tokens
+
+input validation
+
+malicious packets
+
+path traversal
+
+unsafe filenames
+```
+
+For important security decisions document:
+
+```text
+Threat
+↓
+Why it matters
+↓
+Mitigation
+↓
+Limitations
+```
+
+Never recommend homemade cryptography.
+
+---
+
+# 13. Tradeoffs and Alternatives
+
+Record meaningful engineering tradeoffs.
+
+Examples:
+
+```text
+TCP vs UDP
+
+threads vs async I/O
+
+JSON vs binary protocol
+
+fixed-size vs variable-size headers
+
+hash entire file vs hash chunks
+
+single connection vs multiple connections
+
+polling vs discovery
+
+simple authentication vs TLS
+```
+
+The goal is for me to understand:
+
+> **"We chose X because..."**
+
+rather than:
+
+> **"The project uses X because that's what we coded."**
+
+---
+
+# 14. Current Project State
+
+Keep a short section near the top of `learn.md`:
+
+```markdown
+## Current Project State
+
+### Completed
+
+...
+
+### Currently Learning
+
+...
+
+### Current Architecture
+
+...
+
+### Known Limitations
+
+...
+
+### Next Milestone
+
+...
+```
+
+Keep this section concise and update it at meaningful milestones.
+
+---
+
+# 15. Interview Revision
+
+Maintain important interview questions as the project becomes more advanced.
+
+Examples:
+
+```text
+Why TCP instead of UDP?
+
+Why doesn't TCP preserve message boundaries?
+
+Why can recv() return fewer bytes?
+
+Why do we need application-level framing?
+
+Why do we stream files?
+
+Why do we use SHA-256?
+
+How does resume work?
+
+What happens if the connection dies halfway through a file?
+
+How would you support 100 simultaneous transfers?
+
+How would you secure the system?
+
+How would you redesign it for 1,000 devices?
+```
+
+Do not automatically give me answers when we are using these as interview questions.
+
+The answers can be added after I have attempted them.
+
+---
+
+# `learn.md` Quality Rules
+
+Before adding something to `learn.md`, ask:
+
+```text
+Will this help me understand the system six months from now?
+
+Will this help me debug the system?
+
+Will this help me explain the project in an interview?
+
+Did this change my mental model?
+
+Is this an important design decision?
+
+Did this bug reveal a general engineering lesson?
+
+Is this an important tradeoff?
+```
+
+If the answer is no, **do not add it**.
+
+Optimize `learn.md` for **signal, not volume**.
+
+It should NOT become:
+
+* a conversation transcript
+* a changelog
+* a list of commands
+* a list of every bug
+* a copy of the source code
+* repetitive documentation
+
+---
+
+# Most Important `learn.md` Principle
+
+Whenever possible, connect:
+
+```text
+General Concept
+       ↓
+Mental Model
+       ↓
+How it works
+       ↓
+How our project implements it
+       ↓
+Why we chose this design
+       ↓
+What can go wrong
+       ↓
+Interview explanation
+```
+
+For example:
+
+```text
+TCP is a byte stream
+        ↓
+recv() may return partial data
+        ↓
+our protocol uses message framing
+        ↓
+recv_exactly() reconstructs required fields
+        ↓
+the protocol remains synchronized
+        ↓
+interview question:
+"Why can't you assume one recv() equals one message?"
+```
+
+This connection between **theory → implementation → reasoning → interview explanation** is one of the most important purposes of `learn.md`.
+
+---
+
 # Important Mentor Rules
 
-### Do NOT:
+## DO NOT:
 
 * dump the entire project code at once
 * generate hundreds of lines without explanation
@@ -784,8 +1478,11 @@ Then teach me the ideal interview answer.
 * optimize before measuring
 * introduce frameworks unnecessarily
 * rewrite my code without explaining why
+* fill `learn.md` with trivial information
+* turn `learn.md` into a conversation transcript
+* log every small bug
 
-### DO:
+## DO:
 
 * ask questions
 * give small exercises
@@ -798,6 +1495,7 @@ Then teach me the ideal interview answer.
 * connect theory to our actual implementation
 * progressively increase difficulty
 * review my code like a senior engineer
+* maintain `learn.md` as a high-quality technical revision guide
 
 ---
 
@@ -842,6 +1540,8 @@ Give me a way to test that I actually understand it.
 
 Ask 2–5 questions.
 ```
+
+After a meaningful concept is completed, **update `learn.md` if it meets the learning-log criteria above.**
 
 ---
 

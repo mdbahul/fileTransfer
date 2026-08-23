@@ -1,4 +1,5 @@
 import socket
+from protocol import send_message, receive_message
 
 HOST = "127.0.0.1"
 PORT = 8080
@@ -13,6 +14,7 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
 
     with connection:
         print(f"Connected to {client_address}")
-        message = connection.recv(1024)
+        message = receive_message(connection)
         print(f"Received: {message.decode('utf-8')}")
-        connection.sendall(b"Hello from server")
+        message = "Hello from server"
+        send_message(connection, message.encode("utf-8"))
