@@ -9,10 +9,14 @@ This is a revision guide for the engineering decisions and mental models behind 
 - **Milestone 0:** Python virtual environment, `.gitignore`, and basic Git workflow.
 - **Phase 1:** A local TCP client and server exchange a greeting on `127.0.0.1:8080`.
 - **Phase 2:** A reusable length-prefixed message protocol frames byte payloads over TCP.
+- **Phase 3:** Client streams a file to the server with metadata (filename, size) without loading the entire file into memory.
+- **Phase 4:** Client reports cumulative transfer progress and estimated remaining time.
+- **Phase 5:** Client and server calculate and verify SHA-256 digests.
+- **Testing:** Automated integration tests cover binary and zero-byte file transfers.
 
 ### Currently Learning
 
-How to transfer files as a stream of bytes without loading the entire file into memory.
+SHA-256 integrity verification for completed transfers.
 
 ### Current Architecture
 
@@ -20,23 +24,24 @@ How to transfer files as a stream of bytes without loading the entire file into 
 client.py ── TCP connection ──> server.py
     │                              │
     └────── protocol.py ───────────┘
-             framing only
+        framing + metadata
 ```
 
-- `client.py` connects, sends one framed text message, and receives one framed reply.
-- `server.py` listens, accepts one client, receives one framed text message, and replies.
-- `protocol.py` owns length-prefix serialization and exact reads.
+- `client.py` connects, sends file metadata as a framed message, then streams raw file bytes in chunks.
+- `server.py` listens, accepts one client, receives metadata, then writes incoming bytes to a new file until the declared size is reached.
+- `protocol.py` owns length-prefix framing, exact reads, and file metadata serialization.
+- `progress.py` formats transfer statistics and redraws the five-line terminal progress display.
 
 ### Known Limitations
 
 - Localhost only; no LAN discovery or device authentication.
-- One client and one message per server run; no concurrency.
-- No timeouts, retry policy, message types, maximum frame size, or file transfer yet.
-- Payloads are treated as UTF-8 text by the demo programs; files must remain raw bytes in the next phase.
+- One client, one file, one direction per server run; no concurrency.
+- No timeouts, retry policy, maximum frame size, progress reporting, integrity verification, or resume support.
+- No confirmation message from server to client after transfer completes.
 
 ### Next Milestone
 
-Stream a file with metadata (name and size) without loading the whole file into RAM.
+Add SHA-256 integrity verification for completed transfers.
 
 ---
 
@@ -154,7 +159,7 @@ TCP reduces transport-level complexity, but it does not provide application mess
 
 **Correct model:** TCP provides an ordered stream of bytes. It can combine multiple sends into one receive or split one send across multiple receives.
 
-```text
+```python
 sendall(b"hello")
 sendall(b"world")
 
@@ -209,12 +214,17 @@ The protocol layer is separate from application behavior. `client.py` and `serve
 
 Transfer one arbitrary byte payload as a framed message over an already-connected TCP socket.
 
-### Frame Layout
+#### Frame Layout
 
-| Field | Size | Encoding | Description |
-| --- | ---: | --- | --- |
-| Payload length | 4 bytes | Unsigned integer, `!I`, network byte order | Number of payload bytes that follow |
-| Payload | Variable | Raw bytes | The message body |
+```text
+┌────────────────┬──────────┬──────────────────────────────────────────┬─────────────────────────────────────┐
+│     Field      │   Size   │                 Encoding                 │             Description             │
+├────────────────┼──────────┼──────────────────────────────────────────┼─────────────────────────────────────┤
+│ Payload length │  4 bytes │ Unsigned integer, !I, network byte order │ Number of payload bytes that follow │
+├────────────────┼──────────┼──────────────────────────────────────────┼─────────────────────────────────────┤
+│ Payload        │ Variable │ Raw bytes                                │ The message body                    │
+└────────────────┴──────────┴──────────────────────────────────────────┴─────────────────────────────────────┘
+```
 
 ### Sender Procedure
 
@@ -256,6 +266,213 @@ A Python integer is an in-memory object, not a network representation. `struct.p
 
 ---
 
+## Phase 3 — Streaming File Transfer
+
+### Why Not Load the Entire File Into Memory?
+
+**Problem:** `open(path, "rb").read()` returns the entire file as one bytes object in RAM. For a 2 GB video file, that is 2 GB of memory
+consumed instantly. The process may crash, or the OS may start swapping to disk, making everything slow.
+
+**Solution:** Read the file in small fixed-size pieces (chunks) and send each chunk immediately. At any moment, only one chunk (~4 KB)
+lives in memory, regardless of whether the file is 1 MB or 10 GB.
+
+### Mental Model: Streaming
+
+```text
+File on disk (any size)
+    │
+    ├── read 4096 bytes ──→ sendall() ──→ chunk released from memory
+    ├── read 4096 bytes ──→ sendall() ──→ chunk released from memory
+    │   ...
+    └── read last chunk  ──→ sendall() ──→ done
+```
+
+Memory usage stays flat. This is the streaming pattern — it applies to any situation where the full data set does not fit comfortably
+in memory.
+
+### The Standard Streaming Loop
+
+```python
+with open(path, "rb") as f:
+    while True:
+        chunk = f.read(CHUNK_SIZE)
+        if chunk == b"":
+            break
+        process(chunk)
+```
+
+`file.read(n)` returns up to `n` bytes. When the file is exhausted, it returns `b""`. This is the EOF signal. This pattern appears
+everywhere: file I/O, network reading, database cursors, any data source of unknown or large size.
+
+### The Receiver's Counting Loop
+
+The receiver knows the total file size from the metadata. It does not need length prefixes on each chunk. Instead, it counts received
+bytes:
+
+```python
+remaining = file_size
+while remaining > 0:
+    chunk = connection.recv(min(remaining, CHUNK_SIZE))
+    if chunk == b"":
+        raise ConnectionError("Connection closed during transfer")
+    f.write(chunk)
+    remaining -= len(chunk)
+```
+
+**Why `min(remaining, CHUNK_SIZE)`?** Without this, the last `recv()` could request more bytes than the file has left, causing the receiver to
+block forever waiting for bytes that will never arrive — or to accidentally read bytes belonging to a future protocol message.
+
+**Why subtract `len(chunk)` not `CHUNK_SIZE`?** Because `recv()` can return fewer bytes than requested. The actual number of bytes
+received is `len(chunk)`.
+
+### Corrected Mental Model: The Declared File Size Is a Contract
+
+For a zero-byte file, `remaining` starts at zero, so the receive loop does not run. The receiver creates and closes an empty output
+file without calling `recv()`.
+
+The declared file size is a protocol contract between sender and receiver. If the sender sends fewer bytes than declared and closes the
+connection, the receiver writes only the bytes received and then raises `ConnectionError`. The result is a partial file, not a
+successful transfer. If the sender leaves the connection open, the receiver blocks while waiting for the missing bytes.
+
+### Resource Cleanup: `with open(...)`
+
+Always use `with open(path, mode) as f:` instead of `f = open(path, mode)`. The `with` block guarantees the file handle is closed even if an
+exception occurs mid-transfer. An unclosed file handle is a resource leak — the OS has a finite number of file descriptors per
+process.
+
+### Progress Reporting
+
+Progress is derived from values already available in the streaming loop:
+
+```text
+percentage       = transferred_bytes / total_bytes × 100
+average_speed    = transferred_bytes / elapsed_seconds
+remaining_time   = remaining_bytes / average_speed
+```
+
+`time.monotonic()` is used because elapsed-time measurement should not be affected by system clock adjustments. A zero-byte file is
+treated as 100% complete, while speed and ETA remain unavailable until there are transferred bytes and positive elapsed time.
+
+The current speed is a cumulative average from the start of the transfer. Printing after every chunk is useful for learning but may be
+too noisy for large files; a production UI should throttle updates.
+
+---
+
+### Decision: Whole-File SHA-256 Verification
+
+#### Problem
+
+The receiver currently knows how many bytes arrived, but not whether those bytes are identical to the source file.
+
+#### Decision
+
+The sender calculates SHA-256 incrementally while streaming the file, then sends the resulting 32-byte raw digest in a final framed
+checksum message. The receiver calculates SHA-256 incrementally while writing the received bytes, receives the final checksum message,
+and compares the two digests.
+
+#### Why?
+
+This avoids reading a large source file twice. The receiver already knows exactly how many raw file bytes to consume from the metadata,
+so it can safely read the next framed message after the file stream.
+
+#### Alternatives
+
+A 64-character hexadecimal digest is easier for humans to read and log, but doubles the digest's wire size. Including the digest in
+initial metadata would make the metadata self-contained, but requires a separate pre-transfer hash pass. Per-chunk hashes could identify
+the location of corruption and support more selective retries, but they add protocol complexity that is not needed yet.
+
+#### Protocol Sequence
+
+```text
+1. Framed metadata: filename + file size
+2. Raw file bytes: exactly file_size bytes
+3. Framed checksum: 32-byte SHA-256 digest
+```
+
+#### Module Responsibilities
+
+- `client.py` creates one SHA-256 hash object, updates it for every chunk sent, and sends the final digest.
+- `server.py` creates one SHA-256 hash object, updates it for every chunk written, receives the sender's digest, and performs the
+  verification.
+- `protocol.py` remains responsible only for framing bytes and serializing metadata; hashing is application logic, not transport logic.
+- `checksum.py` can hold reusable checksum helpers such as the digest size and a safe digest-comparison function.
+
+#### Failure Policy
+
+A checksum mismatch is an explicit transfer failure. The receiver must not publish the output as a completed file; it should remove or
+quarantine the temporary output and report the failure. Automatic retransmission belongs in a later retry layer with bounded attempts,
+because repeated failure may indicate a protocol bug, source-file mutation, or disk problem rather than transient network loss.
+
+---
+
+### Decision: Two-Phase Transfer Protocol (Metadata Then Stream)
+
+#### Problem
+
+The receiver needs to know the filename and file size before the raw bytes arrive, but loading the entire file into a single framed
+message is not feasible for large files.
+
+#### Decision
+
+Split the transfer into two phases:
+
+```text
+Phase 1: Client sends a framed metadata message (filename + file size)
+Phase 2: Client streams raw file bytes (no per-chunk framing)
+```
+
+#### Why?
+
+The metadata is small and fits naturally in one `send_message()` frame. The file data can be arbitrarily large and must be streamed.
+Separating the two means the framing protocol handles structured messages while raw streaming handles bulk data.
+
+#### Alternatives
+
+- Send everything as one giant framed message — fails for large files (memory + `!I` limit).
+- Frame every chunk individually — adds overhead and complexity without benefit, since the receiver already knows the total size.
+
+#### Tradeoffs
+
+- Simple and memory-efficient.
+- The receiver must trust the declared file size. A malicious or buggy sender could declare a wrong size, causing the receiver to wait
+forever or read too few bytes.
+- No integrity verification yet — the receiver does not know if the bytes arrived correctly.
+
+### Protocol Specification: File Metadata Message
+
+#### Purpose
+
+Tell the receiver what file is about to be transferred.
+
+#### Layout
+
+```text
+┌─────────────────┬──────────┬─────────────────────────────────────────────────┬───────────────────────────────────────────┐
+│      Field      │   Size   │                    Encoding                     │                Description                │
+├─────────────────┼──────────┼─────────────────────────────────────────────────┼───────────────────────────────────────────┤
+│ Filename length │   1 byte │ Unsigned integer, !B                            │ Length of the filename in bytes (max 255) │
+├─────────────────┼──────────┼─────────────────────────────────────────────────┼───────────────────────────────────────────┤
+│ Filename        │ Variable │ UTF-8 bytes                                     │ The file's name (not a full path)         │
+├─────────────────┼──────────┼─────────────────────────────────────────────────┼───────────────────────────────────────────┤
+│ File size       │  8 bytes │ Unsigned 64-bit integer, !Q, network byte order │ Total file size in bytes                  │
+└─────────────────┴──────────┴─────────────────────────────────────────────────┴───────────────────────────────────────────┘
+```
+
+This block is sent as the payload of a standard `send_message()` frame, so the outer `!I` length prefix is handled by the existing framing
+layer.
+
+#### Why `!B` for filename length?
+
+Filenames are almost never longer than 255 bytes. A single unsigned byte (`!B`, range 0–255) is sufficient and wastes no space. If the
+filename exceeds 255 bytes after UTF-8 encoding, `pack_file_metadata()` raises `ValueError`.
+
+#### Why `!Q` for file size?
+
+A 32-bit unsigned integer (`!I`) maxes out at ~4.29 GB. Files larger than that exist (videos, disk images, datasets). A 64-bit unsigned
+integer (`!Q`) supports files up to ~18 exabytes, which is effectively unlimited.
+
+---
+
 ## Architecture Evolution
 
 ### Version 1 — Direct Socket Calls
@@ -270,6 +487,68 @@ A Python integer is an in-memory object, not a network representation. `struct.p
 
 **New complexity:** Every peer must implement the same frame format, and the application must eventually validate message type and maximum size.
 
+### Version 3 — File Transfer with Metadata
+
+`protocol.py` now also owns `pack_file_metadata` and `unpack_file_metadata`. The client sends a metadata message followed by a raw byte
+stream. The server reconstructs the file on disk.
+
+**Problem solved:** Files of any size can be transferred without loading them entirely into memory.
+
+**New complexity:** The receiver trusts the declared file size. No integrity verification, progress reporting, or resume capability exists
+yet.
+
+### Version 4 — Progress Renderer
+
+`client.py` now tracks transferred bytes and elapsed time, while `progress.py` renders the percentage, byte counts, speed, and ETA.
+
+Problem solved: Transfer progress is visible without mixing terminal-control logic into the file-transfer loop.
+
+New complexity: ANSI cursor-control sequences vary in support across terminals, and frequent redraws may be noisy or inefficient for
+large transfers.
+
+### Version 5 — Checksum Unit Tests
+
+The checksum comparison logic is tested independently with matching, different, and different-length digest values.
+
+Problem solved: Basic integrity-comparison behavior can be verified without starting sockets or transferring files.
+
+Testing lesson: Unit tests isolate one responsibility and make failures easier to diagnose. Integration tests will be needed later to
+verify the complete client/server transfer path.
+
+### Version 6 — Testable Transfer Functions
+
+The client and server now expose callable transfer functions, while script execution remains behind `if __name__ == "__main__":`.
+Automated integration tests start a server thread, transfer temporary binary files, and verify the received bytes and digest.
+
+Problem solved: The complete transfer path can be tested repeatedly without manually starting two terminal processes or using large
+fixture files.
+
+New complexity: The test coordinates server readiness and uses an ephemeral local port, while the transfer functions now return
+structured results useful to callers.
+
+### Protocol Tests
+
+The protocol test suite now covers metadata round-tripping, Unicode filenames, filename-length validation, framed message exchange,
+successful exact reads, and connection closure before the requested byte count.
+
+Testing lesson: A real `socketpair()` validates end-to-end socket behavior, but it does not guarantee that a single `recv()` returns a
+partial result. A deterministic fake socket is needed to specifically test partial-read handling; the test suite now includes one.
+
+### Corrected Testing Mental Model: Sends Do Not Define Receives
+
+Calling `sendall()` twice does not guarantee that the receiver performs two corresponding `recv()` calls. TCP may coalesce the sends
+into one read or split them differently. Therefore, the current socket-pair test verifies that the complete byte sequence arrives, but
+not specifically that `recv_exactly()` loops across partial reads. A fake socket with predetermined `recv()` results is required for
+that exact unit test.
+
+### Integration Result: End-to-End SHA-256 Verification
+
+A large ZIP file was transferred through the real client and server. The source and received files had identical sizes and identical
+SHA-256 digests.
+
+This verifies the complete path: streaming reads, TCP transport, bounded receive writes, incremental hashing, final checksum framing,
+and receiver-side comparison. It does not yet test failures, retries, temporary-file cleanup, or automated process orchestration.
+
 ---
 
 ## Interview Revision
@@ -280,3 +559,8 @@ A Python integer is an in-memory object, not a network representation. `struct.p
 4. Why must the server reply through the socket returned by `accept()`?
 5. What is the difference between `sendall()` handling partial writes and application-level message framing?
 6. What limitations must be addressed before this becomes a secure file-transfer application?
+7. Why can't you send a large file as one send_message() call?
+8. Why does the streaming loop use min(remaining, CHUNK_SIZE) instead of just CHUNK_SIZE?
+9. Why do we subtract len(chunk) instead of CHUNK_SIZE when counting received bytes?
+10. Why did we choose `!Q` (64-bit) for the file size instead of `!I` (32-bit)?
+11. How does the receiver know when the file transfer is complete without per-chunk framing?

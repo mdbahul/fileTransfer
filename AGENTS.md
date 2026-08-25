@@ -1549,6 +1549,27 @@ After a meaningful concept is completed, **update `learn.md` if it meets the lea
 
 **Optimize for my learning, not for finishing the project quickly.**
 
+---
+
+# User Interface Progression
+
+Keep the initial implementation terminal-based so the networking and transfer engine remain easy to understand, debug, and test.
+
+The long-term UI architecture should separate presentation from transfer logic:
+
+```text
+Transfer engine
+      ↓
+Progress data/events
+      ├── Terminal renderer
+      ├── Desktop GUI
+      └── Android UI
+```
+
+The transfer engine must report structured progress data rather than printing directly. Complete the reliable core features first,
+including framing, streaming, integrity verification, resume, error handling, and testing. Introduce a desktop GUI only after the core
+architecture is stable, reusing the same transfer engine and progress model.
+
 I should eventually be able to open the codebase six months later and explain:
 
 ```text
