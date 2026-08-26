@@ -1,3 +1,5 @@
+import os
+import time
 from pathlib import Path, PureWindowsPath
 
 
@@ -24,3 +26,36 @@ def validate_filename(filename: str) -> str:
         raise ValueError("Invalid filename")
 
     return filename
+
+
+def cleanup_expired_transfers(
+    output_directory: str,
+    retention_seconds: int,
+) -> None:
+    if retention_seconds < 0:
+        raise ValueError("Retention period cannot be negative")
+
+    now = time.time()
+    for meta_path in Path(output_directory).glob("*.meta"):
+        try:
+            age = now - meta_path.stat().st_mtime
+            if age <= retention_seconds:
+                continue
+
+            part_path = meta_path.with_suffix(".part")
+            if part_path.exists():
+                part_path.unlink()
+            meta_path.unlink()
+        except OSError as error:
+            print(f"Resume cleanup failed for {meta_path.name}: {error}")
+
+
+def sync_directory(directory: str) -> None:
+    if os.name != "posix":
+        return
+
+    directory_fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)

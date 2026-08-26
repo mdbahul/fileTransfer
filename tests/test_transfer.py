@@ -1,14 +1,20 @@
 import hashlib
-import struct
+import os
 import socket
 import tempfile
 import threading
+import time
 import unittest
+import uuid
 from pathlib import Path
 
 import client
 import protocol
 import server
+import utils
+
+
+CHUNK_SIZE = 4096
 
 
 def unused_local_port() -> int:
@@ -40,10 +46,13 @@ class TestFileTransfer(unittest.TestCase):
             server_thread.start()
             self.assertTrue(ready.wait(timeout=2))
 
+            transfer_id = uuid.uuid4()
             digest = client.send_file(
                 str(source_path),
                 "127.0.0.1",
                 port,
+                transfer_id,
+                CHUNK_SIZE,
                 show_progress=False,
             )
 
@@ -67,10 +76,15 @@ class TestFileTransfer(unittest.TestCase):
     def test_empty_file_transfer(self):
         self.assertEqual(self.transfer_file("empty file.bin", b""), b"")
 
-    def start_server(self, output_directory: Path):
+    def start_server(
+        self,
+        output_directory: Path,
+        port: int | None = None,
+        timeout: float = 30.0,
+    ):
         ready = threading.Event()
         result = []
-        port = unused_local_port()
+        port = port if port is not None else unused_local_port()
         server_thread = threading.Thread(
             target=lambda: result.append(
                 server.receive_file(
@@ -78,6 +92,7 @@ class TestFileTransfer(unittest.TestCase):
                     "127.0.0.1",
                     port,
                     ready,
+                    timeout,
                 )
             )
         )
@@ -85,29 +100,242 @@ class TestFileTransfer(unittest.TestCase):
         self.assertTrue(ready.wait(timeout=2))
         return server_thread, result, port
 
-    def test_interrupted_transfer_removes_partial_file(self):
+    def test_interrupted_transfer_resumes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "resume.bin"
+            output_directory = Path(directory) / "received"
+            contents = bytes(range(256)) * 64
+            source_path.write_bytes(contents)
+            transfer_id = uuid.uuid4()
+
+            server_thread, result, port = self.start_server(output_directory)
+            with socket.create_connection(("127.0.0.1", port)) as connection:
+                metadata = protocol.pack_file_metadata(
+                    source_path.name,
+                    len(contents),
+                    transfer_id,
+                    CHUNK_SIZE,
+                )
+                protocol.send_message(connection, metadata)
+
+                status, offset = protocol.unpack_transfer_status(
+                    protocol.receive_message(connection)
+                )
+                self.assertEqual(status, protocol.START_TRANSFER)
+                self.assertEqual(offset, 0)
+
+                connection.sendall(contents[:CHUNK_SIZE])
+
+            server_thread.join(timeout=2)
+            self.assertFalse(server_thread.is_alive())
+            self.assertEqual(result, [None])
+            self.assertEqual(
+                (output_directory / f"{transfer_id}.part").read_bytes(),
+                contents[:CHUNK_SIZE],
+            )
+
+            resumed_server, resumed_result, _ = self.start_server(
+                output_directory,
+                port,
+            )
+            digest = client.send_file(
+                str(source_path),
+                "127.0.0.1",
+                port,
+                transfer_id,
+                CHUNK_SIZE,
+                show_progress=False,
+            )
+
+            resumed_server.join(timeout=2)
+            self.assertFalse(resumed_server.is_alive())
+            self.assertIsNotNone(resumed_result[0])
+            received_path = Path(resumed_result[0])
+            self.assertEqual(received_path.read_bytes(), contents)
+            self.assertEqual(digest, hashlib.sha256(contents).digest())
+            self.assertFalse((output_directory / f"{transfer_id}.part").exists())
+            self.assertFalse((output_directory / f"{transfer_id}.meta").exists())
+
+    def test_corrupted_retained_chunk_is_repaired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "repair.bin"
+            output_directory = Path(directory) / "received"
+            contents = bytes(range(256)) * 48
+            source_path.write_bytes(contents)
+            transfer_id = uuid.uuid4()
+
+            output_directory.mkdir()
+            metadata = protocol.pack_file_metadata(
+                source_path.name,
+                len(contents),
+                transfer_id,
+                CHUNK_SIZE,
+            )
+            corrupted = bytearray(contents[: CHUNK_SIZE * 3])
+            corrupted[CHUNK_SIZE] ^= 0xFF
+            (output_directory / f"{transfer_id}.part").write_bytes(corrupted)
+            (output_directory / f"{transfer_id}.meta").write_bytes(metadata)
+
+            server_thread, result, port = self.start_server(output_directory)
+            digest = client.send_file(
+                str(source_path),
+                "127.0.0.1",
+                port,
+                transfer_id,
+                CHUNK_SIZE,
+                show_progress=False,
+            )
+
+            server_thread.join(timeout=2)
+            self.assertFalse(server_thread.is_alive())
+            self.assertIsNotNone(result[0])
+            self.assertEqual(Path(result[0]).read_bytes(), contents)
+            self.assertEqual(digest, hashlib.sha256(contents).digest())
+            self.assertFalse((output_directory / f"{transfer_id}.part").exists())
+            self.assertFalse((output_directory / f"{transfer_id}.meta").exists())
+
+    def test_mismatched_resume_metadata_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "received"
+            output_directory.mkdir()
+            transfer_id = uuid.uuid4()
+
+            original_metadata = protocol.pack_file_metadata(
+                "resume.bin",
+                100,
+                transfer_id,
+                CHUNK_SIZE,
+            )
+            part_path = output_directory / f"{transfer_id}.part"
+            meta_path = output_directory / f"{transfer_id}.meta"
+            part_path.write_bytes(b"partial")
+            meta_path.write_bytes(original_metadata)
+
+            server_thread, result, port = self.start_server(output_directory)
+            mismatched_metadata = protocol.pack_file_metadata(
+                "resume.bin",
+                200,
+                transfer_id,
+                CHUNK_SIZE,
+            )
+            with socket.create_connection(("127.0.0.1", port)) as connection:
+                protocol.send_message(connection, mismatched_metadata)
+                self.assertEqual(
+                    protocol.unpack_transfer_result(
+                        protocol.receive_message(connection)
+                    ),
+                    protocol.TRANSFER_FAILED,
+                )
+
+            server_thread.join(timeout=2)
+            self.assertFalse(server_thread.is_alive())
+            self.assertEqual(result, [None])
+            self.assertEqual(part_path.read_bytes(), b"partial")
+            self.assertEqual(meta_path.read_bytes(), original_metadata)
+
+    def test_transfer_timeout_retains_partial_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "received"
+            transfer_id = uuid.uuid4()
+            server_thread, result, port = self.start_server(
+                output_directory,
+                timeout=0.05,
+            )
+
+            connection = socket.create_connection(("127.0.0.1", port))
+            try:
+                metadata = protocol.pack_file_metadata(
+                    "timeout.bin",
+                    100,
+                    transfer_id,
+                    CHUNK_SIZE,
+                )
+                protocol.send_message(connection, metadata)
+                status, offset = protocol.unpack_transfer_status(
+                    protocol.receive_message(connection)
+                )
+                self.assertEqual(status, protocol.START_TRANSFER)
+                self.assertEqual(offset, 0)
+
+                server_thread.join(timeout=2)
+                self.assertFalse(server_thread.is_alive())
+                self.assertEqual(result, [None])
+                self.assertEqual(
+                    (output_directory / f"{transfer_id}.part").read_bytes(),
+                    b"",
+                )
+                self.assertTrue((output_directory / f"{transfer_id}.meta").exists())
+            finally:
+                connection.close()
+
+    def test_expired_resume_state_is_cleaned_up(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory)
+            expired_meta = output_directory / "expired.meta"
+            expired_part = output_directory / "expired.part"
+            fresh_meta = output_directory / "fresh.meta"
+            fresh_part = output_directory / "fresh.part"
+
+            expired_meta.write_bytes(b"metadata")
+            expired_part.write_bytes(b"partial")
+            fresh_meta.write_bytes(b"metadata")
+            fresh_part.write_bytes(b"partial")
+
+            expired_time = time.time() - server.RESUME_RETENTION_SECONDS - 1
+            os.utime(expired_meta, (expired_time, expired_time))
+
+            utils.cleanup_expired_transfers(
+                str(output_directory),
+                server.RESUME_RETENTION_SECONDS,
+            )
+
+            self.assertFalse(expired_meta.exists())
+            self.assertFalse(expired_part.exists())
+            self.assertTrue(fresh_meta.exists())
+            self.assertTrue(fresh_part.exists())
+
+    def test_interrupted_transfer_retains_partial_state(self):
         with tempfile.TemporaryDirectory() as directory:
             output_directory = Path(directory) / "received"
             server_thread, result, port = self.start_server(output_directory)
 
+            transfer_id = uuid.uuid4()
+            metadata = protocol.pack_file_metadata(
+                "partial.bin",
+                10,
+                transfer_id,
+                CHUNK_SIZE,
+            )
             with socket.create_connection(("127.0.0.1", port)) as connection:
-                metadata = protocol.pack_file_metadata("partial.bin", 10)
                 protocol.send_message(connection, metadata)
                 connection.sendall(b"short")
 
             server_thread.join(timeout=2)
             self.assertFalse(server_thread.is_alive())
             self.assertEqual(result, [None])
-            self.assertEqual(list(output_directory.iterdir()), [])
+            self.assertEqual(
+                (output_directory / f"{transfer_id}.part").read_bytes(),
+                b"short",
+            )
+            self.assertEqual(
+                (output_directory / f"{transfer_id}.meta").read_bytes(),
+                metadata,
+            )
 
     def test_checksum_mismatch_removes_output_file(self):
         with tempfile.TemporaryDirectory() as directory:
             output_directory = Path(directory) / "received"
             server_thread, result, port = self.start_server(output_directory)
 
+            transfer_id = uuid.uuid4()
             with socket.create_connection(("127.0.0.1", port)) as connection:
                 contents = b"valid file bytes"
-                metadata = protocol.pack_file_metadata("invalid.bin", len(contents))
+                metadata = protocol.pack_file_metadata(
+                    "invalid.bin",
+                    len(contents),
+                    transfer_id,
+                    CHUNK_SIZE,
+                )
                 protocol.send_message(connection, metadata)
                 connection.sendall(contents)
                 protocol.send_message(connection, b"wrong digest")
@@ -122,13 +350,14 @@ class TestFileTransfer(unittest.TestCase):
             output_directory = Path(directory) / "received"
             server_thread, result, port = self.start_server(output_directory)
 
+            transfer_id = uuid.uuid4()
             with socket.create_connection(("127.0.0.1", port)) as connection:
                 filename = "../outside.bin"
-                filename_bytes = filename.encode("utf-8")
-                metadata = (
-                    struct.pack("!B", len(filename_bytes))
-                    + filename_bytes
-                    + struct.pack("!Q", 0)
+                metadata = protocol.pack_file_metadata(
+                    filename,
+                    0,
+                    transfer_id,
+                    CHUNK_SIZE,
                 )
                 protocol.send_message(connection, metadata)
 

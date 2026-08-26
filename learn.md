@@ -10,39 +10,45 @@ This is a revision guide for the engineering decisions and mental models behind 
 - **Phase 1:** A local TCP client and server exchange a greeting on `127.0.0.1:8080`.
 - **Phase 2:** A reusable length-prefixed message protocol frames byte payloads over TCP.
 - **Phase 3:** Client streams a file to the server with metadata (filename, size) without loading the entire file into memory.
-- **Phase 4:** Client reports cumulative transfer progress and estimated remaining time.
-- **Phase 5:** Client and server calculate and verify SHA-256 digests.
+- **Phase 4:** File data is transferred in bounded chunks rather than loaded into memory at once.
+- **Phase 5:** Client reports cumulative transfer progress and estimated remaining time.
+- **Phase 6:** Client and server calculate and verify SHA-256 digests.
 - **Phase 7:** Server handles startup, filesystem, connection, metadata, and checksum failures with cleanup.
-- **Testing:** Automated integration tests cover binary and zero-byte file transfers.
+- **Testing:** Automated unit and integration tests cover binary, zero-byte, partial-read, checksum-failure, interrupted, unsafe-filename,
+  and startup-failure cases.
 
 ### Currently Learning
 
-SHA-256 integrity verification for completed transfers.
+Resume design for interrupted transfers.
 
 ### Current Architecture
 
 ```text
 client.py ── TCP connection ──> server.py
     │                              │
-    └────── protocol.py ───────────┘
-        framing + metadata
+    ├────── protocol.py ───────────┤  framing + metadata
+    ├────── progress.py            │  terminal progress
+    ├────── checksum.py            │  digest comparison
+    └────── utils.py               │  filename validation
 ```
 
 - `client.py` connects, sends file metadata as a framed message, then streams raw file bytes in chunks.
 - `server.py` listens, accepts one client, receives metadata, then writes incoming bytes to a new file until the declared size is reached.
 - `protocol.py` owns length-prefix framing, exact reads, and file metadata serialization.
+- `checksum.py` compares SHA-256 digest bytes.
+- `utils.py` validates received filenames before constructing output paths.
 - `progress.py` formats transfer statistics and redraws the five-line terminal progress display.
 
 ### Known Limitations
 
 - Localhost only; no LAN discovery or device authentication.
 - One client, one file, one direction per server run; no concurrency.
-- No timeouts, retry policy, maximum frame size, progress reporting, integrity verification, or resume support.
+- No timeouts, retry policy, maximum frame size, or resume support.
 - No confirmation message from server to client after transfer completes.
 
 ### Next Milestone
 
-Add SHA-256 integrity verification for completed transfers.
+Design resumable interrupted transfers.
 
 ---
 
@@ -420,6 +426,7 @@ Split the transfer into two phases:
 ```text
 Phase 1: Client sends a framed metadata message (filename + file size)
 Phase 2: Client streams raw file bytes (no per-chunk framing)
+Phase 3: Client sends a framed 32-byte SHA-256 digest
 ```
 
 #### Why?
@@ -437,7 +444,7 @@ Separating the two means the framing protocol handles structured messages while 
 - Simple and memory-efficient.
 - The receiver must trust the declared file size. A malicious or buggy sender could declare a wrong size, causing the receiver to wait
 forever or read too few bytes.
-- No integrity verification yet — the receiver does not know if the bytes arrived correctly.
+- The receiver must not publish the output until checksum verification succeeds.
 
 ### Protocol Specification: File Metadata Message
 
@@ -472,6 +479,17 @@ filename exceeds 255 bytes after UTF-8 encoding, `pack_file_metadata()` raises `
 A 32-bit unsigned integer (`!I`) maxes out at ~4.29 GB. Files larger than that exist (videos, disk images, datasets). A 64-bit unsigned
 integer (`!Q`) supports files up to ~18 exabytes, which is effectively unlimited.
 
+#### Checksum Frame
+
+After the receiver consumes exactly the declared file size, the sender sends one additional framed message:
+
+```text
+[4-byte payload length][32-byte SHA-256 digest]
+```
+
+The receiver hashes the bytes as it writes them, receives this final frame, and compares the raw 32-byte digest with its own result.
+The checksum frame must contain exactly 32 bytes.
+
 ---
 
 ## Architecture Evolution
@@ -495,8 +513,8 @@ stream. The server reconstructs the file on disk.
 
 **Problem solved:** Files of any size can be transferred without loading them entirely into memory.
 
-**New complexity:** The receiver trusts the declared file size. No integrity verification, progress reporting, or resume capability exists
-yet.
+**New complexity:** The receiver initially trusted the declared file size; later phases added progress reporting and whole-file
+integrity verification, while resume support remains future work.
 
 ### Version 4 — Progress Renderer
 
@@ -507,14 +525,16 @@ Problem solved: Transfer progress is visible without mixing terminal-control log
 New complexity: ANSI cursor-control sequences vary in support across terminals, and frequent redraws may be noisy or inefficient for
 large transfers.
 
-### Version 5 — Checksum Unit Tests
+### Version 5 — SHA-256 Verification
 
-The checksum comparison logic is tested independently with matching, different, and different-length digest values.
+The client and server calculate SHA-256 incrementally while transferring and writing chunks. The client sends the final raw 32-byte
+digest in a framed message, and the server compares it with its own digest.
 
-Problem solved: Basic integrity-comparison behavior can be verified without starting sockets or transferring files.
+Problem solved: The receiver can detect whether the reconstructed file matches the sender's source bytes without reading the source file
+twice.
 
-Testing lesson: Unit tests isolate one responsibility and make failures easier to diagnose. Integration tests will be needed later to
-verify the complete client/server transfer path.
+Design lesson: A digest in initial metadata would require a separate pre-transfer hash pass. Sending the digest after the known-length
+raw stream allows one read pass while preserving whole-file verification.
 
 ### Version 6 — Testable Transfer Functions
 
@@ -527,6 +547,15 @@ fixture files.
 New complexity: The test coordinates server readiness and uses an ephemeral local port, while the transfer functions now return
 structured results useful to callers.
 
+### Version 7 — Explicit Error Handling
+
+The server now distinguishes metadata/checksum errors, connection failures, filesystem failures, and startup binding failures. Failed
+transfers remove partial output files, and received filenames are validated before constructing output paths.
+
+Problem solved: A failed or malicious transfer is not reported as successful and does not normally leave a misleading partial file.
+
+New complexity: Resume support will require temporary-file retention, transfer identity, expiration, and a more detailed failure state.
+
 ---
 
 ## Phase 7 — Error Handling
@@ -536,18 +565,139 @@ structured results useful to callers.
 If a connection closes before the declared file size is received, or checksum verification fails, the receiver deletes the partial
 output and reports an unsuccessful transfer. This prevents callers from mistaking an incomplete or corrupted file for a completed one.
 
-### Future Resume-Compatible Policy
+### Initial Resume-Compatible Policy
 
-When resume support is introduced, the receiver can write to a uniquely identified temporary file and retain it for a bounded period.
-Metadata such as transfer ID, expected size, and source digest should be stored with it. A cleanup process can delete abandoned
-temporary transfers after a time-to-live expires, while an active retry refreshes that deadline.
+The receiver now writes to a transfer-ID-based `.part` file and stores the original metadata payload in a matching `.meta` file.
+Interrupted transfers retain both files so a reconnect can identify and continue the same transfer. A successful final checksum
+verification renames the `.part` file to the final filename and removes the metadata file.
 
-The temporary file must never be exposed under the final filename until verification succeeds.
+The current implementation does not yet expire abandoned state or negotiate a resume offset. Those are the next resume steps. The
+The current implementation does not yet expire abandoned state or validate resume offsets with chunk hashes. The temporary file is never
+exposed under the final filename until verification succeeds.
+
+### Offset Negotiation
+
+The receiver now sends a framed binary status after metadata:
+
+```text
+status       : 1 byte
+resume offset: 8-byte unsigned integer
+```
+
+`START_TRANSFER` reports offset zero; `RESUME_TRANSFER` reports the retained `.part` size. The sender hashes the source prefix up to
+that offset, seeks to the offset, and streams only the remaining bytes. Both peers therefore include the same complete byte sequence
+in their final SHA-256 calculation. This offset is not yet independently validated by chunk hashes.
+
+### Chunk-Hash Control Messages
+
+The protocol now reserves two framed binary messages:
+
+```text
+HASH_REQUEST  = [1-byte type][8-byte unsigned chunk count]
+HASH_RESPONSE = [1-byte type][8-byte unsigned hash count][count × 32-byte SHA-256 digests]
+```
+
+The outer four-byte length prefix remains unchanged. Hash responses use raw digest bytes rather than hexadecimal text, and the
+protocol rejects incorrect types, truncated payloads, trailing bytes, and hashes that are not exactly 32 bytes. A zero-hash response is
+structurally valid for a zero-offset case.
+
+The server now rounds a retained file size down to a complete-chunk boundary, requests hashes for that prefix, compares them with its
+own `.part` chunks, truncates at the first mismatch, and only then sends the corrected resume status. The client reads the requested
+source chunks from offset zero and returns their raw SHA-256 digests before seeking to the corrected offset. This prevents corrupted
+retained bytes from being treated as a valid resume point.
+
+After checksum verification, the server sends a one-byte framed transfer result: `TRANSFER_COMPLETE` only after publishing the final
+file, or `TRANSFER_FAILED` when verification fails. The client must receive `TRANSFER_COMPLETE` before reporting success; sending the
+digest alone does not prove that the receiver accepted the transfer.
 
 ### Error-Handling Tests
 
 Automated integration tests now cover an interrupted transfer, checksum mismatch, unsafe filename, and server startup failure. These
 tests verify both the reported failure and the important side effect: incomplete output is not left behind.
+
+The resume integration test now interrupts a transfer after one complete chunk, restarts the server, reconnects with the same transfer
+ID, validates the retained chunk hash, and completes the file. It verifies that the final bytes and whole-file digest match and that
+the `.part` and `.meta` files are removed only after successful publication.
+
+The corrupted-resume test preloads a partial file with a bad second chunk. The server detects the mismatch, truncates at that chunk's
+start, and the resumed client repairs the remainder. This protects against blindly trusting the retained byte count.
+
+The metadata-mismatch test reconnects with the same transfer ID but a different file size. The server rejects the request and leaves
+the existing `.part` and `.meta` files unchanged, preventing unrelated data from being appended to retained state.
+
+### Idle Socket Timeout
+
+Connected sockets now use a configurable 30-second timeout. This is an idle timeout: each successful read or write gives the peer
+another window, so a large active transfer may run longer than 30 seconds. A stalled peer cannot block the server forever, and timeout
+failures retain resumable state. The listening socket remains blocking so the server can wait indefinitely for a new connection.
+
+### Acknowledgment and Commit Ordering
+
+The server can finish writing and publishing a file but crash before the client receives `TRANSFER_COMPLETE`. In that case the client
+observes failure even though the receiver has completed the operation. Sending the acknowledgment before publishing has the opposite
+failure window: the client may observe success while the server crashes before the final file is committed.
+
+This is an acknowledgement/idempotency problem, not merely a line-ordering problem. A robust design commits the verified file first,
+then acknowledges, and retains a completion record keyed by `transfer_id` so a retry after a lost acknowledgment can be recognized as
+already complete. Immediate deletion of all transfer metadata makes that retry indistinguishable from a new transfer.
+
+For the current prototype, `client.py` has no automatic retry policy and the application is intended for trusted peers, so completion
+records are deliberately deferred. A crash or lost acknowledgment can therefore produce an ambiguous client result even when the server
+has already published the file. This is an accepted limitation, not an unnoticed guarantee.
+
+The server records its local success state immediately after publication verification and metadata cleanup, before attempting to send
+the completion acknowledgment. This prevents a failed acknowledgment write from triggering cleanup of an already-published transfer,
+but it does not remove the client-visible ambiguity after a process crash.
+
+### What “Published” Means
+
+File publication has separate levels. Content verification means the computed SHA-256 matches. Logical publication means
+`os.replace(part_path, output_path)` succeeds, atomically making the verified bytes visible under the final name. A basic postcondition
+can also confirm that the final path exists with the expected size. Crash durability is stronger: the file must be flushed with
+`fsync`, and the containing directory may also need to be synchronized so the rename survives a sudden power loss. The protocol must
+define which level is required before sending `TRANSFER_COMPLETE`.
+
+The current server implements logical publication verification: after `os.replace`, it confirms that the final path is a regular file
+with the declared size before acknowledging completion. Full crash durability with explicit `fsync` remains a separate enhancement.
+
+The server now flushes and synchronizes the partial file before renaming it, then synchronizes the containing directory after the
+rename. The directory operation is isolated in `utils.py`; it is applied on POSIX systems, while the file-level synchronization
+remains cross-platform. This improves crash durability but does not solve lost acknowledgments or provide transactional behavior.
+
+Control frames are expected to contain a message payload, so the client now rejects an empty server response explicitly instead of
+indexing `response[0]` and raising an unrelated `IndexError`. Generic framing may still support empty payloads; each protocol state
+must validate whether an empty message is meaningful there.
+
+Handshake validation failures now use an explicit `TRANSFER_FAILED` frame. This is preferable to simply closing the connection because
+the peer can distinguish a rejected transfer from an unexpected network failure and keep the protocol state understandable.
+
+### Corrected Security Mental Model: Local Does Not Mean Trusted
+
+An offline LAN is not automatically a trusted environment. Unknown devices, compromised devices, buggy clients, or malformed packets
+can still connect and exhaust memory or keep connections occupied. Authentication does not protect the unauthenticated handshake
+itself. Framed-message size limits are therefore a small defense-in-depth measure even before full authentication exists.
+
+### Trusted-Peer Prototype Scope
+
+The prototype keeps length-prefix framing for message boundaries but does not enforce a maximum framed payload size. This is deliberate
+because the current scope assumes trusted peers and is not intended for public deployment. If that scope changes, frame limits and
+batched hash responses should be added before accepting arbitrary LAN devices.
+
+### Resume-State Retention Decision
+
+Abandoned `.part` and `.meta` files will be retained for eight hours. This gives a sender time to reconnect after a temporary failure
+without allowing interrupted transfers to consume disk space indefinitely. The initial cleanup implementation can use the `.meta` file's
+modification time as the state timestamp; a later design may store explicit expiration metadata.
+
+### Cleanup Lifecycle Limitation
+
+TTL cleanup performed by `server.py` is lazy: it runs only while the application is executing, such as during startup or before handling
+a connection. If the application is never launched again, expired files cannot be deleted by that process. A persistent application can
+use a background cleanup task, while an OS scheduler or service manager is needed to guarantee cleanup when the application is stopped.
+
+The cleanup operation now lives in `utils.py`, where it scans `.meta` files and removes expired matching `.part` files. `server.py`
+owns the eight-hour retention policy and invokes the utility at startup. Separating the operation from the policy keeps the filesystem
+helper reusable and makes the prototype's lazy-cleanup limitation explicit.
 
 ### Protocol Tests
 
@@ -572,6 +722,81 @@ SHA-256 digests.
 This verifies the complete path: streaming reads, TCP transport, bounded receive writes, incremental hashing, final checksum framing,
 and receiver-side comparison. It does not yet test failures, retries, temporary-file cleanup, or automated process orchestration.
 
+## Phase 8 — Resume Design Foundations
+
+### Corrected Mental Model: Final Verification Is Not Resume Identity
+
+The receiver should report the partial transfer's filename and byte offset, but the offset alone is not enough to authorize resuming.
+The source file may have changed since the interruption, or the partial file may belong to a different transfer.
+
+The final SHA-256 comparison proves that the completed bytes match the sender's expected content. It happens too late to safely decide
+whether an existing partial file is the correct file to continue. Resume negotiation therefore also needs stable transfer metadata such
+as a transfer ID, filename, declared size, and an expected content identity.
+
+### Corrected Mental Model: Retain Temporarily, Never Publish Early
+
+Deleting every partial file prevents resuming. The receiver should instead retain an identified temporary file for a bounded period,
+along with its resume metadata. It must not expose that temporary file as the final output. After the resumed transfer reaches the
+declared size and passes SHA-256 verification, the temporary file can be published under its final name. Expiration and cleanup prevent
+abandoned transfers from consuming disk space indefinitely.
+
+### Initial Resume State
+
+A resume record will need to associate a temporary file with:
+
+```text
+transfer_id
+filename
+file_size
+bytes_received
+expected content identity
+temporary path
+expiration time
+```
+
+The exact content-identity strategy remains a design question. A full hash can identify the complete source contents, but obtaining it
+before transfer may require an additional source-file read. A transfer ID identifies a negotiation, but by itself does not prove that
+the source bytes are unchanged.
+
+### Resume Design Direction: Validate the Retained Prefix by Chunks
+
+The receiver can request expected hashes for the chunks covering its retained `.part` file instead of receiving a complete hash
+manifest before every transfer. It validates those chunks and resumes at the first missing or invalid chunk. If validation fails, the
+temporary file must be truncated to that chunk's start; bytes after the failure cannot be trusted.
+
+This reduces upfront metadata for large files, but requires a fixed chunk size, chunk-boundary offsets, a way to identify the same
+transfer, and protocol messages for hash requests and responses. The final whole-file SHA-256 comparison remains the authoritative
+completion check.
+
+### Resume Protocol Mental Model
+
+The retained byte offset is a candidate resume point, not an automatically trusted one. After reconnecting, the peers must identify the
+same transfer, agree that its metadata matches, validate retained chunks, and resume from the first missing or invalid chunk. Only then
+does the sender seek and stream the remaining bytes. Final SHA-256 verification is followed by publishing the temporary file.
+
+Candidate `RESUME_REQUEST` fields are `transfer_id`, `filename`, `file_size`, `chunk_size`, and `existing_size`. The transfer ID
+distinguishes same-named files, while size and chunk-size agreement prevents incompatible state from being resumed. These fields still
+require a content-identity strategy before the wire format is finalized.
+
+### Transfer ID Ownership
+
+The client, as transfer initiator, creates the `transfer_id` and sends it in the initial metadata. The receiver persists that ID with
+the temporary file and its resume state. The client must also retain enough local state to reuse the ID after a reconnect or process
+restart; an identifier held only in memory cannot identify the original transfer after a crash.
+
+### Chunk Validation Versus Complete-File Identity
+
+Validating hashes for retained chunks proves that the prefix being reused still matches the sender's current source bytes. It does not
+prove that bytes after the retained offset are unchanged. A later whole-file SHA-256 comparison remains necessary to reject a source
+file that changed elsewhere. This design may spend bandwidth before discovering such a change, but it avoids a mandatory full-file
+pre-hash pass and never publishes an unverified result.
+
+### Resume From the First Invalid Chunk
+
+If retained chunks 1 and 2 validate but chunk 3 fails, the resume point is the byte offset at the start of chunk 3. The receiver must
+truncate the temporary file to that offset before resuming. All bytes after that point are discarded and rewritten, because they may be
+stale or corrupted. The sender seeks to the same offset, keeping both sides aligned.
+
 ---
 
 ## Interview Revision
@@ -587,3 +812,8 @@ and receiver-side comparison. It does not yet test failures, retries, temporary-
 9. Why do we subtract len(chunk) instead of CHUNK_SIZE when counting received bytes?
 10. Why did we choose `!Q` (64-bit) for the file size instead of `!I` (32-bit)?
 11. How does the receiver know when the file transfer is complete without per-chunk framing?
+12. Why is the checksum sent after the raw file stream instead of in the initial metadata?
+13. Why does a checksum mismatch require deleting or quarantining the output file?
+14. Why is SHA-256 integrity verification not the same as authentication or encryption?
+15. Why should received filenames be validated before constructing output paths?
+16. Which failures should be caught and reported separately from unexpected programming errors?
