@@ -15,6 +15,9 @@ def send_file(
     port: int,
     show_progress: bool = True,
 ) -> bytes:
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:
         client_socket.connect((host, port))
 

@@ -12,6 +12,7 @@ This is a revision guide for the engineering decisions and mental models behind 
 - **Phase 3:** Client streams a file to the server with metadata (filename, size) without loading the entire file into memory.
 - **Phase 4:** Client reports cumulative transfer progress and estimated remaining time.
 - **Phase 5:** Client and server calculate and verify SHA-256 digests.
+- **Phase 7:** Server handles startup, filesystem, connection, metadata, and checksum failures with cleanup.
 - **Testing:** Automated integration tests cover binary and zero-byte file transfers.
 
 ### Currently Learning
@@ -525,6 +526,28 @@ fixture files.
 
 New complexity: The test coordinates server readiness and uses an ephemeral local port, while the transfer functions now return
 structured results useful to callers.
+
+---
+
+## Phase 7 — Error Handling
+
+### Decision: Remove Incomplete Files During the Initial Implementation
+
+If a connection closes before the declared file size is received, or checksum verification fails, the receiver deletes the partial
+output and reports an unsuccessful transfer. This prevents callers from mistaking an incomplete or corrupted file for a completed one.
+
+### Future Resume-Compatible Policy
+
+When resume support is introduced, the receiver can write to a uniquely identified temporary file and retain it for a bounded period.
+Metadata such as transfer ID, expected size, and source digest should be stored with it. A cleanup process can delete abandoned
+temporary transfers after a time-to-live expires, while an active retry refreshes that deadline.
+
+The temporary file must never be exposed under the final filename until verification succeeds.
+
+### Error-Handling Tests
+
+Automated integration tests now cover an interrupted transfer, checksum mismatch, unsafe filename, and server startup failure. These
+tests verify both the reported failure and the important side effect: incomplete output is not left behind.
 
 ### Protocol Tests
 
