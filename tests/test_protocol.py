@@ -171,6 +171,14 @@ class TestMessages(unittest.TestCase):
         with self.assertRaises(ValueError):
             protocol.unpack_transfer_result(b"\x01")
 
+    def test_transfer_acceptance_round_trip(self):
+        data = protocol.pack_transfer_acceptance()
+        self.assertIsNone(protocol.unpack_transfer_acceptance(data))
+
+    def test_transfer_acceptance_rejects_invalid_data(self):
+        with self.assertRaises(ValueError):
+            protocol.unpack_transfer_acceptance(b"\x01")
+
     def test_transfer_status_round_trip(self):
         for status in (protocol.START_TRANSFER, protocol.RESUME_TRANSFER):
             with self.subTest(status=status):

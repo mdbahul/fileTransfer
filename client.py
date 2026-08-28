@@ -4,6 +4,7 @@ import socket
 import time
 import uuid
 
+import discovery
 import progress
 import protocol
 
@@ -43,6 +44,11 @@ def send_file(
         if response[0] == protocol.TRANSFER_FAILED:
             protocol.unpack_transfer_result(response)
             raise ValueError("Server rejected transfer")
+        if response[0] == protocol.TRANSFER_ACCEPTED:
+            protocol.unpack_transfer_acceptance(response)
+            response = protocol.receive_message(client_socket)
+            if not response:
+                raise ValueError("Empty server response")
 
         if response[0] == protocol.HASH_REQUEST:
             hash_count = protocol.unpack_hash_request(response)
@@ -73,6 +79,7 @@ def send_file(
 
         start = time.monotonic()
         bytes_transferred = offset
+        session_transferred = 0
         first_render = True
         hasher = hashlib.sha256()
 
@@ -95,6 +102,7 @@ def send_file(
                 hasher.update(chunk)
                 client_socket.sendall(chunk)
                 bytes_transferred += len(chunk)
+                session_transferred += len(chunk)
 
                 if show_progress:
                     progress.render_progress(
@@ -103,6 +111,7 @@ def send_file(
                         file_size,
                         time.monotonic() - start,
                         first_render,
+                        session_transferred,
                     )
                 first_render = False
 
@@ -121,6 +130,7 @@ def send_file(
                 file_size,
                 time.monotonic() - start,
                 first_render,
+                session_transferred,
             )
             print(f"Sent: {filename} {progress.format_bytes(file_size)}")
 
@@ -128,11 +138,38 @@ def send_file(
 
 
 if __name__ == "__main__":
-    HOST = "127.0.0.1"
-    PORT = 8080
-    FILE_PATH = "/Users/new/Desktop/fileTransfer/tests/test.txt"
+    FILE_PATH = input("Enter the path of the file to send: ").strip()
+    if not FILE_PATH:
+        raise SystemExit("A file path is required")
+
     CHUNK_SIZE = 4096
 
-    transfer_id = uuid.uuid4()
+    devices = discovery.broadcast_discovery()
+    if not devices:
+        raise SystemExit("No file-transfer devices found")
 
-    send_file(FILE_PATH, HOST, PORT, transfer_id, CHUNK_SIZE)
+    print("Discovered devices:")
+    for index, device in enumerate(devices, start=1):
+        print(f"{index}. {device.device_name} ({device.ip_address}:{device.tcp_port})")
+
+    try:
+        selection = int(input("Choose a device number: "))
+        device = devices[selection - 1]
+    except (ValueError, IndexError):
+        raise SystemExit("Invalid device selection")
+
+    file_stat = os.stat(FILE_PATH)
+    transfer_key = (
+        f"{os.path.abspath(FILE_PATH)}:"
+        f"{file_stat.st_size}:{file_stat.st_mtime_ns}"
+    )
+    transfer_id = uuid.uuid5(uuid.NAMESPACE_URL, transfer_key)
+
+    send_file(
+        FILE_PATH,
+        device.ip_address,
+        device.tcp_port,
+        transfer_id,
+        CHUNK_SIZE,
+        timeout=150.0,
+    )

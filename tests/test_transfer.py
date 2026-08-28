@@ -233,6 +233,132 @@ class TestFileTransfer(unittest.TestCase):
             self.assertEqual(part_path.read_bytes(), b"partial")
             self.assertEqual(meta_path.read_bytes(), original_metadata)
 
+    def test_rejected_transfer_cleans_resume_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "received"
+            output_directory.mkdir()
+            transfer_id = uuid.uuid4()
+            metadata = protocol.pack_file_metadata(
+                "rejected.bin",
+                100,
+                transfer_id,
+                CHUNK_SIZE,
+            )
+            part_path = output_directory / f"{transfer_id}.part"
+            meta_path = output_directory / f"{transfer_id}.meta"
+            part_path.write_bytes(b"partial")
+            meta_path.write_bytes(metadata)
+
+            server_socket, client_socket = socket.socketpair()
+            server_thread = threading.Thread(
+                target=server._handle_connection,
+                args=(
+                    server_socket,
+                    ("127.0.0.1", 12345),
+                    str(output_directory),
+                    30.0,
+                    lambda *_: False,
+                ),
+            )
+            server_thread.start()
+            try:
+                protocol.send_message(client_socket, metadata)
+                self.assertEqual(
+                    protocol.unpack_transfer_result(
+                        protocol.receive_message(client_socket)
+                    ),
+                    protocol.TRANSFER_FAILED,
+                )
+            finally:
+                client_socket.close()
+
+            server_thread.join(timeout=2)
+            self.assertFalse(server_thread.is_alive())
+            self.assertFalse(part_path.exists())
+            self.assertFalse(meta_path.exists())
+
+    def test_two_transfers_can_run_concurrently(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "received"
+            output_directory.mkdir()
+            transfers = [
+                (uuid.uuid4(), "first.bin", b"a" * (CHUNK_SIZE * 2)),
+                (uuid.uuid4(), "second.bin", b"b" * (CHUNK_SIZE * 2)),
+            ]
+            socket_pairs = [socket.socketpair() for _ in transfers]
+            server_threads = []
+            client_results = []
+
+            for (transfer_id, filename, _), (server_socket, _) in zip(
+                transfers,
+                socket_pairs,
+            ):
+                thread = threading.Thread(
+                    target=server._handle_connection,
+                    args=(
+                        server_socket,
+                        ("127.0.0.1", 12345),
+                        str(output_directory),
+                        30.0,
+                    ),
+                )
+                server_threads.append(thread)
+                thread.start()
+
+            def send_transfer(
+                client_socket: socket.socket,
+                transfer_id: uuid.UUID,
+                filename: str,
+                contents: bytes,
+            ) -> None:
+                with client_socket:
+                    metadata = protocol.pack_file_metadata(
+                        filename,
+                        len(contents),
+                        transfer_id,
+                        CHUNK_SIZE,
+                    )
+                    protocol.send_message(client_socket, metadata)
+                    status, offset = protocol.unpack_transfer_status(
+                        protocol.receive_message(client_socket)
+                    )
+                    self.assertEqual(status, protocol.START_TRANSFER)
+                    self.assertEqual(offset, 0)
+                    client_socket.sendall(contents)
+                    protocol.send_message(
+                        client_socket,
+                        hashlib.sha256(contents).digest(),
+                    )
+                    client_results.append(
+                        protocol.unpack_transfer_result(
+                            protocol.receive_message(client_socket)
+                        )
+                    )
+
+            client_threads = [
+                threading.Thread(target=send_transfer, args=(pair[1], *transfer))
+                for pair, transfer in zip(socket_pairs, transfers)
+            ]
+            for thread in client_threads:
+                thread.start()
+            for thread in client_threads:
+                thread.join(timeout=2)
+            for thread in server_threads:
+                thread.join(timeout=2)
+
+            self.assertEqual(
+                client_results,
+                [protocol.TRANSFER_COMPLETE, protocol.TRANSFER_COMPLETE],
+            )
+            self.assertEqual(
+                (output_directory / "received_first.bin").read_bytes(),
+                transfers[0][2],
+            )
+            self.assertEqual(
+                (output_directory / "received_second.bin").read_bytes(),
+                transfers[1][2],
+            )
+
     def test_transfer_timeout_retains_partial_state(self):
         with tempfile.TemporaryDirectory() as directory:
             output_directory = Path(directory) / "received"

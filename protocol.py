@@ -17,6 +17,7 @@ HASH_REQUEST = 3
 HASH_RESPONSE = 4
 TRANSFER_COMPLETE = 5
 TRANSFER_FAILED = 6
+TRANSFER_ACCEPTED = 7
 
 
 def recv_exactly(sock, size):
@@ -121,6 +122,15 @@ def unpack_transfer_result(data: bytes) -> int:
     if status not in (TRANSFER_COMPLETE, TRANSFER_FAILED):
         raise ValueError("Invalid transfer result")
     return status
+
+
+def pack_transfer_acceptance() -> bytes:
+    return struct.pack("!B", TRANSFER_ACCEPTED)
+
+
+def unpack_transfer_acceptance(data: bytes) -> None:
+    if len(data) != 1 or struct.unpack("!B", data)[0] != TRANSFER_ACCEPTED:
+        raise ValueError("Invalid transfer acceptance")
 
 
 def pack_file_metadata(

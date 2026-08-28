@@ -16,18 +16,22 @@ def render_progress(
     total: int,
     elapsed: float,
     first_render: bool,
+    session_transferred: int | None = None,
 ) -> None:
     
     if not first_render:
         print("\033[5F", end="")
+
+    if session_transferred is None:
+        session_transferred = transferred
 
     percentage = (transferred / total) * 100 if total else 100
     bar_width = 20
     filled = min(bar_width, int((percentage / 100) * bar_width))
     progress_bar = "█" * filled + "░" * (bar_width - filled)
 
-    if elapsed > 0 and transferred > 0:
-        speed = transferred / elapsed
+    if elapsed > 0 and session_transferred > 0:
+        speed = session_transferred / elapsed
         eta = (total - transferred) / speed
         speed_text = f"{format_bytes(int(speed))}/s"
         eta_text = f"{eta:.0f} sec"
