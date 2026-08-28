@@ -1,13 +1,4 @@
-def format_bytes(value: int) -> str:
-    units = ("B", "KB", "MB", "GB", "TB")
-    size = float(value)
-    unit_index = 0
-
-    while size >= 1024 and unit_index < len(units) - 1:
-        size /= 1024
-        unit_index += 1
-
-    return f"{size:.1f} {units[unit_index]}"
+import utils
 
 
 def render_progress(
@@ -33,7 +24,7 @@ def render_progress(
     if elapsed > 0 and session_transferred > 0:
         speed = session_transferred / elapsed
         eta = (total - transferred) / speed
-        speed_text = f"{format_bytes(int(speed))}/s"
+        speed_text = f"{utils.format_bytes(int(speed))}/s"
         eta_text = f"{eta:.0f} sec"
     else:
         speed_text = "unavailable"
@@ -42,7 +33,8 @@ def render_progress(
     lines = (
         filename,
         f"[{progress_bar}] {percentage:.0f}%",
-        f"Transferred: {format_bytes(transferred)} / {format_bytes(total)}",
+        f"Transferred: {utils.format_bytes(transferred)} / "
+        f"{utils.format_bytes(total)}",
         f"Speed: {speed_text}",
         f"ETA: {eta_text}",
     )

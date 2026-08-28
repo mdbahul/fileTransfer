@@ -3,6 +3,18 @@ import time
 from pathlib import Path, PureWindowsPath
 
 
+def format_bytes(value: int) -> str:
+    units = ("B", "KB", "MB", "GB", "TB")
+    size = float(value)
+    unit_index = 0
+
+    while size >= 1024 and unit_index < len(units) - 1:
+        size /= 1024
+        unit_index += 1
+
+    return f"{size:.1f} {units[unit_index]}"
+
+
 def validate_filename(filename: str) -> str:
     """
     Validate a filename received from a peer.

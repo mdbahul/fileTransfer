@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import os
 import select
@@ -202,7 +203,7 @@ def _handle_connection(
             )
             print(
                 f"Received: {os.path.basename(output_path)} "
-                f"({file_size} bytes)"
+                f"({utils.format_bytes(file_size)})"
             )
         except ValueError as error:
             try:
@@ -273,9 +274,13 @@ def serve(
     host: str,
     port: int,
     timeout: float = 30.0,
+    device_name: str | None = None,
+    discovery_port: int = discovery.DISCOVERY_PORT,
 ) -> None:
     if timeout <= 0:
         raise ValueError("Timeout must be positive")
+    if not 0 <= port <= 65535:
+        raise ValueError("TCP port must be between 0 and 65535")
     os.makedirs(output_directory, exist_ok=True)
     utils.cleanup_expired_transfers(
         output_directory,
@@ -286,7 +291,18 @@ def serve(
         server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server_socket.bind((host, port))
         server_socket.listen()
-        print(f"Waiting for clients on {host}:{port}...")
+        actual_port = server_socket.getsockname()[1]
+        discovery_thread = Thread(
+            target=discovery.listen_for_discovery,
+            kwargs={
+                "device_name": device_name or socket.gethostname(),
+                "tcp_port": actual_port,
+                "discovery_port": discovery_port,
+            },
+            daemon=True,
+        )
+        discovery_thread.start()
+        print(f"Waiting for clients on {host}:{actual_port}...")
 
         while True:
             connection, client_address = server_socket.accept()
@@ -304,17 +320,31 @@ def serve(
 
 
 if __name__ == "__main__":
-    HOST = "0.0.0.0"
-    PORT = 8080
-    OUTPUT_DIRECTORY = "tests"
-
-    discovery_thread = Thread(
-        target=discovery.listen_for_discovery,
-        kwargs={
-            "device_name": socket.gethostname(),
-            "tcp_port": PORT,
-        },
-        daemon=True,
+    parser = argparse.ArgumentParser(
+        description="Receive files from LAN devices"
     )
-    discovery_thread.start()
-    serve(OUTPUT_DIRECTORY, HOST, PORT)
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=0,
+        help="TCP port; 0 asks the OS to choose a free port",
+    )
+    parser.add_argument("--output-dir", default="received")
+    parser.add_argument("--device-name", default=socket.gethostname())
+    parser.add_argument(
+        "--discovery-port",
+        type=int,
+        default=discovery.DISCOVERY_PORT,
+    )
+    parser.add_argument("--timeout", type=float, default=30.0)
+    args = parser.parse_args()
+
+    serve(
+        args.output_dir,
+        args.host,
+        args.port,
+        args.timeout,
+        args.device_name,
+        args.discovery_port,
+    )

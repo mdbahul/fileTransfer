@@ -1,3 +1,4 @@
+import argparse
 import hashlib
 import os
 import socket
@@ -7,6 +8,8 @@ import uuid
 import discovery
 import progress
 import protocol
+
+DEFAULT_CHUNK_SIZE = 64 * 1024
 
 
 def send_file(
@@ -138,13 +141,33 @@ def send_file(
 
 
 if __name__ == "__main__":
-    FILE_PATH = input("Enter the path of the file to send: ").strip()
+    parser = argparse.ArgumentParser(description="Send a file to a LAN device")
+    parser.add_argument(
+        "file",
+        nargs="?",
+        help="path of the file to send",
+    )
+    parser.add_argument(
+        "--discovery-port",
+        type=int,
+        default=discovery.DISCOVERY_PORT,
+        help="UDP discovery port",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=150.0,
+        help="network operation timeout in seconds",
+    )
+    args = parser.parse_args()
+
+    FILE_PATH = args.file or input("Enter the path of the file to send: ").strip()
     if not FILE_PATH:
         raise SystemExit("A file path is required")
 
-    CHUNK_SIZE = 4096
+    CHUNK_SIZE = DEFAULT_CHUNK_SIZE
 
-    devices = discovery.broadcast_discovery()
+    devices = discovery.broadcast_discovery(args.discovery_port)
     if not devices:
         raise SystemExit("No file-transfer devices found")
 
@@ -171,5 +194,5 @@ if __name__ == "__main__":
         device.tcp_port,
         transfer_id,
         CHUNK_SIZE,
-        timeout=150.0,
+        timeout=args.timeout,
     )
