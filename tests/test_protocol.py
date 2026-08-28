@@ -58,6 +58,27 @@ class TestFileMetadata(unittest.TestCase):
         self.assertEqual(result_file_size, file_size)
         self.assertEqual(result_chunk_size, chunk_size)
 
+    def test_transfer_kind_round_trip(self):
+        transfer_id = uuid.uuid4()
+        data = protocol.pack_file_metadata(
+            "directory",
+            5000,
+            transfer_id,
+            4096,
+            protocol.TRANSFER_KIND_DIRECTORY,
+        )
+
+        self.assertEqual(
+            protocol.unpack_transfer_metadata(data),
+            (
+                transfer_id,
+                "directory",
+                5000,
+                4096,
+                protocol.TRANSFER_KIND_DIRECTORY,
+            ),
+        )
+
     def test_filename_too_long(self):
         transfer_id = uuid.uuid4()
         filename = "a" * 256
@@ -77,6 +98,30 @@ class TestFileMetadata(unittest.TestCase):
                         transfer_id,
                         chunk_size,
                     )
+
+    def test_invalid_transfer_kind(self):
+        transfer_id = uuid.uuid4()
+
+        with self.assertRaises(ValueError):
+            protocol.pack_file_metadata(
+                "test.bin",
+                100,
+                transfer_id,
+                4096,
+                99,
+            )
+
+        metadata = bytearray(
+            protocol.pack_file_metadata(
+                "test.bin",
+                100,
+                transfer_id,
+                4096,
+            )
+        )
+        metadata[-1] = 99
+        with self.assertRaises(ValueError):
+            protocol.unpack_transfer_metadata(bytes(metadata))
 
     def test_metadata_too_short(self):
         with self.assertRaises(ValueError):

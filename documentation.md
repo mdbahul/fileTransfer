@@ -29,8 +29,8 @@ Checksum verification and atomic publication
 
 | Module | Responsibility |
 | --- | --- |
-| `client.py` | Selects a file, discovers devices, sends metadata and file data |
-| `server.py` | Listens for TCP clients, approves transfers, receives files |
+| `client.py` | Selects files/directories, discovers devices, sends metadata and data |
+| `server.py` | Listens for TCP clients, approves transfers, receives/extracts data |
 | `discovery.py` | Sends and receives UDP discovery messages |
 | `protocol.py` | Defines binary framing and transfer control messages |
 | `utils.py` | Filename validation, byte formatting, cleanup, filesystem sync |
@@ -99,7 +99,7 @@ message therefore uses this frame:
 `protocol.recv_exactly()` repeatedly calls `recv()` until the requested
 number of bytes has arrived.
 
-### File metadata payload
+### Transfer metadata payload
 
 The metadata payload is binary:
 
@@ -109,15 +109,19 @@ filename_length    1 byte
 filename          UTF-8 bytes
 file_size         8 bytes, network byte order
 chunk_size        4 bytes, network byte order
+transfer_kind     1 byte (`1` = file, `2` = directory)
 ```
 
 The filename length is measured in encoded UTF-8 bytes, not Python
-characters.
+characters. A directory is archived temporarily by the client, but its
+metadata retains the original directory name and identifies it as a
+directory. A ZIP chosen as an ordinary file retains file semantics and is
+not extracted.
 
 ### Transfer flow
 
 ```text
-1. Client sends framed file metadata.
+1. Client sends framed transfer metadata.
 2. Interactive server asks the receiver to accept or reject.
 3. Server sends acceptance or failure.
 4. Server requests hashes for retained chunks when resuming.
@@ -126,7 +130,8 @@ characters.
 7. Client streams file bytes from that offset.
 8. Client sends a framed SHA-256 digest.
 9. Server verifies the digest and file size.
-10. Server atomically renames the .part file to the final output.
+10. Server atomically renames a file `.part`, or safely extracts a directory
+    archive into a temporary directory and atomically publishes it.
 11. Server sends TRANSFER_COMPLETE or TRANSFER_FAILED.
 ```
 
@@ -177,9 +182,12 @@ Received filenames are rejected if they contain:
 - NUL characters.
 - Invalid or empty names.
 
-An existing destination file is not overwritten; the transfer is rejected.
+An existing destination file or directory is not overwritten; the transfer is
+rejected. Directory archives reject absolute paths, traversal, backslashes,
+symlink entries, and conflicting entries before publication.
 
-The server writes to a `.part` file and publishes the final file only after:
+The server writes to a `.part` file and publishes the final file or directory
+only after:
 
 - The expected number of bytes has been received.
 - The SHA-256 digest matches.

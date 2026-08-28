@@ -86,9 +86,13 @@ def _handle_connection(
 
         try:
             metadata = protocol.receive_message(connection)
-            transfer_id, filename, file_size, chunk_size = (
-                protocol.unpack_file_metadata(metadata)
-            )
+            (
+                transfer_id,
+                filename,
+                file_size,
+                chunk_size,
+                transfer_kind,
+            ) = protocol.unpack_transfer_metadata(metadata)
             filename = utils.validate_filename(filename)
             part_path = os.path.join(output_directory, f"{transfer_id}.part")
             meta_path = os.path.join(output_directory, f"{transfer_id}.meta")
@@ -117,7 +121,7 @@ def _handle_connection(
 
             output_path = os.path.join(output_directory, f"received_{filename}")
             if os.path.exists(output_path):
-                raise ValueError("Destination file already exists")
+                raise ValueError("Destination already exists")
 
             if os.path.exists(meta_path):
                 with open(meta_path, "rb") as file:
@@ -190,12 +194,20 @@ def _handle_connection(
             if not checksum.digest_match(expected_digest, hasher.digest()):
                 raise ValueError("SHA-256 checksum mismatch")
 
-            os.replace(part_path, output_path)
-            utils.sync_directory(output_directory)
-            if not os.path.isfile(output_path):
-                raise OSError("Published file is missing")
-            if os.path.getsize(output_path) != file_size:
-                raise OSError("Published file size does not match metadata")
+            if transfer_kind == protocol.TRANSFER_KIND_DIRECTORY:
+                output_path = utils.extract_directory_archive(
+                    part_path,
+                    output_directory,
+                    filename,
+                )
+                os.remove(part_path)
+            else:
+                os.replace(part_path, output_path)
+                utils.sync_directory(output_directory)
+                if not os.path.isfile(output_path):
+                    raise OSError("Published file is missing")
+                if os.path.getsize(output_path) != file_size:
+                    raise OSError("Published file size does not match metadata")
 
             os.remove(meta_path)
             success = True

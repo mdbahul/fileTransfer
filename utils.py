@@ -1,5 +1,9 @@
 import os
+import shutil
+import stat
+import tempfile
 import time
+import zipfile
 from pathlib import Path, PureWindowsPath
 
 
@@ -71,3 +75,76 @@ def sync_directory(directory: str) -> None:
         os.fsync(directory_fd)
     finally:
         os.close(directory_fd)
+
+
+def extract_directory_archive(
+    archive_path: str,
+    output_directory: str,
+    directory_name: str,
+) -> str:
+    """Safely extract an archive and atomically publish the received directory."""
+    validate_filename(directory_name)
+    output_path = Path(output_directory) / f"received_{directory_name}"
+    if output_path.exists():
+        raise ValueError("Destination directory already exists")
+
+    temporary_path = Path(
+        tempfile.mkdtemp(
+            prefix=f".received_{directory_name}.",
+            dir=output_directory,
+        )
+    ).resolve()
+    seen_names: set[str] = set()
+
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            for info in archive.infolist():
+                name = info.filename
+                if (
+                    not name
+                    or "\x00" in name
+                    or "\\" in name
+                    or Path(name).is_absolute()
+                    or PureWindowsPath(name).is_absolute()
+                    or PureWindowsPath(name).drive
+                ):
+                    raise ValueError("Archive contains an unsafe path")
+
+                relative_path = Path(name)
+                if ".." in relative_path.parts or name in seen_names:
+                    raise ValueError("Archive contains an unsafe path")
+                seen_names.add(name)
+
+                mode = (info.external_attr >> 16) & 0o170000
+                if mode == stat.S_IFLNK:
+                    raise ValueError("Archive contains a symlink")
+                if mode not in (0, stat.S_IFREG, stat.S_IFDIR):
+                    raise ValueError("Archive contains an unsupported entry")
+
+                destination = temporary_path / relative_path
+                resolved_destination = destination.resolve()
+                if (
+                    resolved_destination != temporary_path
+                    and temporary_path not in resolved_destination.parents
+                ):
+                    raise ValueError("Archive contains an unsafe path")
+
+                if info.is_dir() or name.endswith("/"):
+                    destination.mkdir(parents=True, exist_ok=True)
+                    continue
+
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if destination.exists() and not destination.is_file():
+                    raise ValueError("Archive contains conflicting entries")
+                with archive.open(info) as source, destination.open("wb") as target:
+                    shutil.copyfileobj(source, target)
+
+        os.replace(temporary_path, output_path)
+        sync_directory(output_directory)
+        return str(output_path)
+    except zipfile.BadZipFile as error:
+        shutil.rmtree(temporary_path, ignore_errors=True)
+        raise ValueError("Invalid directory archive") from error
+    except (OSError, ValueError, zipfile.BadZipFile):
+        shutil.rmtree(temporary_path, ignore_errors=True)
+        raise

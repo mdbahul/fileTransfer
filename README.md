@@ -12,7 +12,10 @@ verification and resume support.
 - Receiver approval before a transfer begins.
 - Concurrent transfers using one worker thread per connection.
 - Length-prefixed application-level TCP framing.
-- Streaming binary file transfer without loading the whole file into memory.
+- Streaming binary file and directory transfer without loading the whole
+  archive into memory.
+- Directories are archived temporarily by the client and safely extracted by
+  the receiver.
 - Configurable transfer chunk size through the Python API.
 - SHA-256 integrity verification.
 - Resume support for interrupted transfers.
@@ -73,8 +76,13 @@ Or provide the file path directly:
 python client.py /path/to/file.zip
 ```
 
+The client also accepts a directory path. It archives the directory
+temporarily, transfers it through the same verified/resumable pipeline, and
+the receiver publishes it as `received_<directory-name>`.
+An ordinary ZIP selected as a file remains a ZIP file and is not extracted.
+
 The client discovers available devices, displays their names, IP addresses,
-and TCP ports, and asks which device should receive the file.
+and TCP ports, and asks which device should receive the file or directory.
 
 ## Architecture
 
@@ -101,8 +109,8 @@ Main modules:
 
 | File | Responsibility |
 | --- | --- |
-| `client.py` | File selection, discovery, sending, resume coordination |
-| `server.py` | TCP listener, worker threads, approval, receiving |
+| `client.py` | File/directory selection, discovery, sending, resume coordination |
+| `server.py` | TCP listener, worker threads, approval, receiving/extraction |
 | `discovery.py` | UDP discovery request and response handling |
 | `protocol.py` | Binary framing and transfer message encoding |
 | `utils.py` | Filename validation, formatting, cleanup, filesystem helpers |
@@ -142,6 +150,12 @@ Metadata
   -> Receiver verification
   -> Completion or failure result
 ```
+
+Metadata includes a transfer kind (`file` or `directory`). A directory's
+temporary ZIP archive is transferred as binary data, but is never published as
+a ZIP file; it is safely extracted into a temporary directory and atomically
+renamed to `received_<directory-name>`. ZIP entries with traversal or absolute
+paths, backslashes, or symlinks are rejected.
 
 Partial transfers are stored as:
 

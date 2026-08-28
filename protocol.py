@@ -18,6 +18,8 @@ HASH_RESPONSE = 4
 TRANSFER_COMPLETE = 5
 TRANSFER_FAILED = 6
 TRANSFER_ACCEPTED = 7
+TRANSFER_KIND_FILE = 1
+TRANSFER_KIND_DIRECTORY = 2
 
 
 def recv_exactly(sock, size):
@@ -138,24 +140,35 @@ def pack_file_metadata(
     file_size: int,
     transfer_id: uuid.UUID,
     chunk_size: int,
+    transfer_kind: int = TRANSFER_KIND_FILE,
 ) -> bytes:
     filename_bytes = filename.encode("utf-8")
     if len(filename_bytes) > 255:
         raise ValueError("Filename too long")
     if chunk_size <= 0:
         raise ValueError("Chunk size must be positive")
+    if transfer_kind not in (TRANSFER_KIND_FILE, TRANSFER_KIND_DIRECTORY):
+        raise ValueError("Invalid transfer kind")
     data = (
         transfer_id.bytes
         + struct.pack("!B", len(filename_bytes))
         + filename_bytes
         + struct.pack("!Q", file_size)
         + struct.pack("!I", chunk_size)
+        + struct.pack("!B", transfer_kind)
     )
     return data
 
 
 def unpack_file_metadata(data: bytes) -> tuple[uuid.UUID, str, int, int]:
-    minimum_size = 16 + 1 + 8 + 4
+    transfer_id, filename, file_size, chunk_size, _ = unpack_transfer_metadata(data)
+    return transfer_id, filename, file_size, chunk_size
+
+
+def unpack_transfer_metadata(
+    data: bytes,
+) -> tuple[uuid.UUID, str, int, int, int]:
+    minimum_size = 16 + 1 + 8 + 4 + 1
     if len(data) < minimum_size:
         raise ValueError("Metadata is too short")
 
@@ -163,8 +176,7 @@ def unpack_file_metadata(data: bytes) -> tuple[uuid.UUID, str, int, int]:
     filename_length = struct.unpack("!B", data[16:17])[0]
     filename_start = 17
     filename_end = filename_start + filename_length
-    expected_size = filename_end + 8 + 4
-
+    expected_size = filename_end + 8 + 4 + 1
     if len(data) != expected_size:
         raise ValueError("Invalid metadata length")
 
@@ -182,4 +194,8 @@ def unpack_file_metadata(data: bytes) -> tuple[uuid.UUID, str, int, int]:
     chunk_size_end = chunk_size_start + 4
     chunk_size = struct.unpack("!I", data[chunk_size_start: chunk_size_end])[0]
 
-    return transfer_id, filename, file_size, chunk_size
+    transfer_kind = struct.unpack("!B", data[chunk_size_end:expected_size])[0]
+    if transfer_kind not in (TRANSFER_KIND_FILE, TRANSFER_KIND_DIRECTORY):
+        raise ValueError("Invalid transfer kind")
+
+    return transfer_id, filename, file_size, chunk_size, transfer_kind

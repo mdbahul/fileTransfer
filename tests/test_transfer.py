@@ -1,11 +1,13 @@
 import hashlib
 import os
 import socket
+import stat
 import tempfile
 import threading
 import time
 import unittest
 import uuid
+import zipfile
 from pathlib import Path
 
 import client
@@ -75,6 +77,108 @@ class TestFileTransfer(unittest.TestCase):
 
     def test_empty_file_transfer(self):
         self.assertEqual(self.transfer_file("empty file.bin", b""), b"")
+
+    def test_directory_transfer_round_trip(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_directory = Path(directory) / "project folder"
+            (source_directory / "nested").mkdir(parents=True)
+            (source_directory / "empty").mkdir()
+            (source_directory / "root.txt").write_text("root contents")
+            (source_directory / "nested" / "data.bin").write_bytes(
+                bytes(range(256))
+            )
+            output_directory = Path(directory) / "received"
+            server_thread, result, port = self.start_server(output_directory)
+
+            digest = client.send_file(
+                str(source_directory),
+                "127.0.0.1",
+                port,
+                uuid.uuid4(),
+                CHUNK_SIZE,
+                show_progress=False,
+            )
+
+            server_thread.join(timeout=2)
+            self.assertFalse(server_thread.is_alive())
+            received_directory = Path(result[0])
+            self.assertEqual(received_directory.name, "received_project folder")
+            self.assertEqual(
+                (received_directory / "root.txt").read_text(),
+                "root contents",
+            )
+            self.assertEqual(
+                (received_directory / "nested" / "data.bin").read_bytes(),
+                bytes(range(256)),
+            )
+            self.assertTrue((received_directory / "empty").is_dir())
+            self.assertEqual(len(digest), protocol.HASH_SIZE)
+
+    def test_directory_archive_rejects_malicious_paths(self):
+        malicious_names = (
+            "../escape.txt",
+            "/absolute.txt",
+            "C:/absolute.txt",
+            "nested\\escape.txt",
+        )
+        for malicious_name in malicious_names:
+            with self.subTest(malicious_name=malicious_name):
+                with tempfile.TemporaryDirectory() as directory:
+                    archive_path = Path(directory) / "malicious.zip"
+                    output_directory = Path(directory) / "received"
+                    output_directory.mkdir()
+                    with zipfile.ZipFile(archive_path, "w") as archive:
+                        archive.writestr(malicious_name, b"bad")
+
+                    with self.assertRaises(ValueError):
+                        utils.extract_directory_archive(
+                            str(archive_path),
+                            str(output_directory),
+                            "safe-name",
+                        )
+                    self.assertFalse(
+                        (output_directory / "received_safe-name").exists()
+                    )
+
+        with tempfile.TemporaryDirectory() as directory:
+            archive_path = Path(directory) / "symlink.zip"
+            output_directory = Path(directory) / "received"
+            output_directory.mkdir()
+            info = zipfile.ZipInfo("link")
+            info.create_system = 3
+            info.external_attr = stat.S_IFLNK << 16
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.writestr(info, "outside.txt")
+
+            with self.assertRaises(ValueError):
+                utils.extract_directory_archive(
+                    str(archive_path),
+                    str(output_directory),
+                    "safe-name",
+                )
+
+    def test_zip_file_transfer_is_not_extracted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "bundle.zip"
+            with zipfile.ZipFile(source_path, "w") as archive:
+                archive.writestr("inside.txt", b"zip contents")
+
+            output_directory = Path(directory) / "received"
+            server_thread, result, port = self.start_server(output_directory)
+            client.send_file(
+                str(source_path),
+                "127.0.0.1",
+                port,
+                uuid.uuid4(),
+                CHUNK_SIZE,
+                show_progress=False,
+            )
+
+            server_thread.join(timeout=2)
+            received_path = Path(result[0])
+            self.assertTrue(received_path.is_file())
+            self.assertTrue(zipfile.is_zipfile(received_path))
+            self.assertFalse((received_path.parent / "inside.txt").exists())
 
     def start_server(
         self,

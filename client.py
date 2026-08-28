@@ -2,14 +2,67 @@ import argparse
 import hashlib
 import os
 import socket
+import tempfile
 import time
 import uuid
+import zipfile
+from pathlib import Path
 
 import discovery
 import progress
 import protocol
 
 DEFAULT_CHUNK_SIZE = 64 * 1024
+
+
+def _archive_directory(directory_path: str, archive_path: str) -> None:
+    directory = Path(directory_path)
+
+    def raise_on_error(error: OSError) -> None:
+        raise error
+
+    with zipfile.ZipFile(
+        archive_path,
+        "w",
+        compression=zipfile.ZIP_DEFLATED,
+    ) as archive:
+        for root, directories, filenames in os.walk(
+            directory,
+            topdown=True,
+            onerror=raise_on_error,
+            followlinks=False,
+        ):
+            directories.sort()
+            filenames.sort()
+            root_path = Path(root)
+            relative_root = root_path.relative_to(directory)
+
+            for name in directories:
+                path = root_path / name
+                if path.is_symlink():
+                    raise ValueError(
+                        "Directories containing symlinks are not supported"
+                    )
+                relative_name = (relative_root / name).as_posix() + "/"
+                info = zipfile.ZipInfo(relative_name, (1980, 1, 1, 0, 0, 0))
+                info.create_system = 3
+                info.external_attr = (0o40755 << 16) | 0x10
+                archive.writestr(info, b"")
+
+            for name in filenames:
+                path = root_path / name
+                if path.is_symlink():
+                    raise ValueError(
+                        "Directories containing symlinks are not supported"
+                    )
+                relative_name = (relative_root / name).as_posix()
+                info = zipfile.ZipInfo(relative_name, (1980, 1, 1, 0, 0, 0))
+                info.create_system = 3
+                info.external_attr = 0o100644 << 16
+                info.compress_type = zipfile.ZIP_DEFLATED
+                with path.open("rb") as source, archive.open(info, "w") as target:
+                    while chunk := source.read(DEFAULT_CHUNK_SIZE):
+                        target.write(chunk)
 
 
 def send_file(
@@ -26,18 +79,61 @@ def send_file(
     if timeout <= 0:
         raise ValueError("Timeout must be positive")
 
+    if os.path.isdir(file_path):
+        directory_name = os.path.basename(os.path.normpath(file_path))
+        with tempfile.TemporaryDirectory(
+            prefix="file-transfer-archive-"
+        ) as temporary_directory:
+            archive_path = os.path.join(temporary_directory, "directory.zip")
+            _archive_directory(file_path, archive_path)
+            return _send_prepared_file(
+                archive_path,
+                host,
+                port,
+                transfer_id,
+                chunk_size,
+                show_progress,
+                timeout,
+                protocol.TRANSFER_KIND_DIRECTORY,
+                directory_name,
+            )
+
+    return _send_prepared_file(
+        file_path,
+        host,
+        port,
+        transfer_id,
+        chunk_size,
+        show_progress,
+        timeout,
+        protocol.TRANSFER_KIND_FILE,
+        os.path.basename(file_path),
+    )
+
+
+def _send_prepared_file(
+    file_path: str,
+    host: str,
+    port: int,
+    transfer_id: uuid.UUID,
+    chunk_size: int,
+    show_progress: bool,
+    timeout: float,
+    transfer_kind: int,
+    display_name: str,
+) -> bytes:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as client_socket:
         client_socket.settimeout(timeout)
         client_socket.connect((host, port))
 
         file_size = os.path.getsize(file_path)
-        filename = os.path.basename(file_path)
 
         metadata = protocol.pack_file_metadata(
-            filename,
+            display_name,
             file_size,
             transfer_id,
             chunk_size,
+            transfer_kind,
         )
         protocol.send_message(client_socket, metadata)
         response = protocol.receive_message(client_socket)
@@ -109,7 +205,7 @@ def send_file(
 
                 if show_progress:
                     progress.render_progress(
-                        filename,
+                        display_name,
                         bytes_transferred,
                         file_size,
                         time.monotonic() - start,
@@ -128,24 +224,26 @@ def send_file(
 
         if show_progress:
             progress.render_progress(
-                filename,
+                display_name,
                 bytes_transferred,
                 file_size,
                 time.monotonic() - start,
                 first_render,
                 session_transferred,
             )
-            print(f"Sent: {filename} {progress.format_bytes(file_size)}")
+            print(f"Sent: {display_name} {progress.format_bytes(file_size)}")
 
         return digest
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Send a file to a LAN device")
+    parser = argparse.ArgumentParser(
+        description="Send a file or directory to a LAN device"
+    )
     parser.add_argument(
         "file",
         nargs="?",
-        help="path of the file to send",
+        help="path of the file or directory to send",
     )
     parser.add_argument(
         "--discovery-port",
@@ -161,9 +259,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    FILE_PATH = args.file or input("Enter the path of the file to send: ").strip()
+    FILE_PATH = args.file or input(
+        "Enter the path of the file or directory to send: "
+    ).strip()
     if not FILE_PATH:
-        raise SystemExit("A file path is required")
+        raise SystemExit("A file or directory path is required")
 
     CHUNK_SIZE = DEFAULT_CHUNK_SIZE
 
