@@ -471,6 +471,37 @@ class TestFileTransfer(unittest.TestCase):
             self.assertEqual(result, [None])
             self.assertEqual(list(output_directory.iterdir()), [])
 
+    def test_existing_output_file_is_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output_directory = Path(directory) / "received"
+            output_directory.mkdir()
+            existing_path = output_directory / "received_existing.bin"
+            existing_contents = b"keep this file"
+            existing_path.write_bytes(existing_contents)
+
+            server_thread, result, port = self.start_server(output_directory)
+            transfer_id = uuid.uuid4()
+            with socket.create_connection(("127.0.0.1", port)) as connection:
+                contents = b"replacement bytes"
+                metadata = protocol.pack_file_metadata(
+                    "existing.bin",
+                    len(contents),
+                    transfer_id,
+                    CHUNK_SIZE,
+                )
+                protocol.send_message(connection, metadata)
+                self.assertEqual(
+                    protocol.unpack_transfer_result(
+                        protocol.receive_message(connection)
+                    ),
+                    protocol.TRANSFER_FAILED,
+                )
+
+            server_thread.join(timeout=2)
+            self.assertFalse(server_thread.is_alive())
+            self.assertEqual(result, [None])
+            self.assertEqual(existing_path.read_bytes(), existing_contents)
+
     def test_unsafe_filename_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             output_directory = Path(directory) / "received"

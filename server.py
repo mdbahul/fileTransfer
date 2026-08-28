@@ -116,6 +116,8 @@ def _handle_connection(
                 )
 
             output_path = os.path.join(output_directory, f"received_{filename}")
+            if os.path.exists(output_path):
+                raise ValueError("Destination file already exists")
 
             if os.path.exists(meta_path):
                 with open(meta_path, "rb") as file:
